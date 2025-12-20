@@ -89,18 +89,25 @@ def worker_process_export_srt(
     input_path: str,
     msg_queue: queue.Queue,
     source_lang: str = None,
+    model_size: str = None,
     pause_event: threading.Event = None,
     current_process_holder: list = None,
     stop_event: threading.Event = None,
 ):
-    """Run main.py to export subtitle file only"""
+    """Run main.py with --export-srt flag to export subtitle file only"""
     try:
         # Build command for exporting SRT
-        cmd = [sys.executable, "main.py", "--input", input_path]
+        cmd = [sys.executable, "main.py", "--export-srt", "--input", input_path]
 
-        # Add language flag if Japanese
-        if source_lang == "ja":
-            cmd.insert(2, "--jp")
+        # Add language flag for non-English languages
+        if source_lang and source_lang != "en":
+            cmd.insert(2, "--language")
+            cmd.insert(3, source_lang)
+
+        # Add model size flag if specified
+        if model_size:
+            cmd.append("--model")
+            cmd.append(model_size)
 
         msg_queue.put(f"Command: {' '.join(cmd)}\n")
         msg_queue.put("=" * 80 + "\n")
@@ -226,10 +233,125 @@ def worker_process_export_srt(
         msg_queue.put("__DONE__:False:")
 
 
+def worker_process_voiceover(
+    input_path: str,
+    msg_queue: queue.Queue,
+    source_lang: str = None,
+    model_size: str = None,
+    pause_event: threading.Event = None,
+    current_process_holder: list = None,
+    stop_event: threading.Event = None,
+    voice: str = None,
+):
+    """Run main.py with --voiceover flag to create video with Vietnamese TTS"""
+    try:
+        # Build command for voiceover
+        cmd = [sys.executable, "main.py", "--voiceover", "--input", input_path]
+
+        # Add language flag for non-English languages
+        if source_lang and source_lang != "en":
+            cmd.insert(2, "--language")
+            cmd.insert(3, source_lang)
+
+        # Add model size flag if specified
+        if model_size:
+            cmd.append("--model")
+            cmd.append(model_size)
+
+        # Add voice flag if specified
+        if voice:
+            cmd.append("--voice")
+            cmd.append(voice)
+
+        # Add output path
+        downloads = Path.home() / "Downloads"
+        downloads.mkdir(parents=True, exist_ok=True)
+        stem = Path(input_path).stem
+        output_file = downloads / f"{stem}_voiceover.mp4"
+        cmd.extend(["--output", str(output_file)])
+
+        msg_queue.put(f"Command: {' '.join(cmd)}\n")
+        msg_queue.put("=" * 80 + "\n")
+
+        # Set environment to force UTF-8 encoding for subprocess
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        # Run subprocess and capture output in real-time with proper encoding
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            universal_newlines=True,
+            env=env,
+        )
+
+        # Store process reference for external termination
+        if current_process_holder is not None:
+            current_process_holder[0] = process
+
+        # Read output line by line
+        paused_notified = False
+        for line in iter(process.stdout.readline, ""):
+            # Check if we should stop
+            if stop_event and stop_event.is_set():
+                msg_queue.put("\n⚠ Processing terminated by user")
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                break
+
+            if line:
+                # Check if paused
+                if pause_event and not pause_event.is_set():
+                    if not paused_notified:
+                        msg_queue.put("__PAUSED__")
+                        paused_notified = True
+
+                    # Wait until resumed or stopped
+                    while not pause_event.is_set():
+                        if stop_event and stop_event.is_set():
+                            msg_queue.put("\n⚠ Processing terminated by user")
+                            process.terminate()
+                            try:
+                                process.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                            return
+                        pause_event.wait(timeout=0.1)
+
+                    msg_queue.put("__RESUMED__")
+                    paused_notified = False
+
+                # Clean ANSI escape codes that cause garbled text
+                clean_line = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip())
+                msg_queue.put(clean_line)
+
+        process.stdout.close()
+        return_code = process.wait()
+
+        if return_code == 0:
+            msg_queue.put(f"__DONE__:True:{output_file}")
+        else:
+            msg_queue.put("__DONE__:False:")
+
+    except Exception as e:
+        msg_queue.put(f"Exception in worker: {e}\n")
+        msg_queue.put(traceback.format_exc())
+        msg_queue.put("__DONE__:False:")
+
+
 def worker_process(
     input_path: str,
     msg_queue: queue.Queue,
     source_lang: str = None,
+    model_size: str = None,
     pause_event: threading.Event = None,
     current_process_holder: list = None,
     stop_event: threading.Event = None,
@@ -243,6 +365,11 @@ def worker_process(
         if source_lang and source_lang != "en":
             cmd.insert(2, "--language")
             cmd.insert(3, source_lang)
+
+        # Add model size flag if specified
+        if model_size:
+            cmd.append("--model")
+            cmd.append(model_size)
 
         # Add output path
         downloads = Path.home() / "Downloads"
@@ -390,15 +517,14 @@ class AppTk(QMainWindow):
         self.stop_event = threading.Event()  # Event to signal worker to stop
         self.is_paused = False
         self.paused_elapsed_time = 0  # Track elapsed time when paused
+        self.button_state = "start"  # Track button state: start, stop, continue
 
         self.init_ui()
 
-        # Setup timer to poll queue
         self.timer = QTimer()
         self.timer.timeout.connect(self._poll_queue)
         self.timer.start(100)
 
-        # Timer to check for presence of temporary SRT file
         self.srt_timer = QTimer()
         self.srt_timer.timeout.connect(self._check_for_srt)
         self.srt_timer.start(1000)
@@ -410,27 +536,21 @@ class AppTk(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Vietnamese Subtitle Generator")
         self.setGeometry(100, 100, 900, 730)
-        # Allow the window to be resized by the user and set a sensible minimum
-        self.setMinimumSize(640, 480)
+        self.setMinimumSize(560, 400)
 
-        # Remove default title bar for custom look
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
 
-        # Center window on screen
         frame_geometry = self.frameGeometry()
         screen_center = self.screen().availableGeometry().center()
         frame_geometry.moveCenter(screen_center)
         self.move(frame_geometry.topLeft())
 
-        # Variables for window dragging
         self.drag_position = None
 
-        # Main widget and layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
 
-        # Set background color with border
         main_widget.setStyleSheet(
             f"""
             QWidget {{
@@ -591,8 +711,8 @@ class AppTk(QMainWindow):
         content_widget = QWidget()
         content_widget.setStyleSheet("background: transparent; border: none;")
         content_layout = QVBoxLayout()
-        content_layout.setContentsMargins(20, 15, 20, 20)
-        content_layout.setSpacing(15)
+        content_layout.setContentsMargins(12, 10, 12, 12)
+        content_layout.setSpacing(12)
         content_widget.setLayout(content_layout)
         main_layout.addWidget(content_widget)
 
@@ -604,7 +724,7 @@ class AppTk(QMainWindow):
         )
         content_layout.addWidget(self.subtitle_label)
 
-        content_layout.addSpacing(10)
+        content_layout.addSpacing(6)
 
         # Card for file selection
         self.file_card = QFrame()
@@ -613,23 +733,23 @@ class AppTk(QMainWindow):
             QFrame {{
                 background-color: {self.colors['card_bg']};
                 border-radius: 8px;
-                padding: 18px;
+                padding: 12px;
             }}
         """
         )
         file_layout = QVBoxLayout()
-        file_layout.setSpacing(8)
+        file_layout.setSpacing(6)
         self.file_card.setLayout(file_layout)
 
         self.file_label = QLabel(self.t("video_file"))
-        self.file_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.file_label.setFont(QFont("Segoe UI", 9, QFont.Bold))
         self.file_label.setStyleSheet(
             f"color: {self.colors['text_dark']}; background: transparent;"
         )
         file_layout.addWidget(self.file_label)
 
         file_row = QHBoxLayout()
-        file_row.setSpacing(12)
+        file_row.setSpacing(8)
 
         self.entry = QLineEdit()
         self.entry.setFont(QFont("Segoe UI", 10))
@@ -684,26 +804,24 @@ class AppTk(QMainWindow):
             QFrame {{
                 background-color: {self.colors['card_bg']};
                 border-radius: 8px;
-                padding: 18px;
+                padding: 12px;
             }}
         """
         )
         lang_layout = QVBoxLayout()
-        lang_layout.setSpacing(8)
+        lang_layout.setSpacing(6)
         self.lang_card.setLayout(lang_layout)
 
-        # Create horizontal layout for label and help button
         lang_header_layout = QHBoxLayout()
-        lang_header_layout.setSpacing(8)
+        lang_header_layout.setSpacing(4)
 
         self.lang_label = QLabel(self.t("source_language"))
-        self.lang_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.lang_label.setFont(QFont("Segoe UI", 9, QFont.Bold))
         self.lang_label.setStyleSheet(
             f"color: {self.colors['text_dark']}; background: transparent;"
         )
         lang_header_layout.addWidget(self.lang_label)
 
-        # Help button with tooltip
         self.help_btn = QPushButton("?")
         self.help_btn.setFixedSize(16, 16)
         self.help_btn.setCursor(Qt.PointingHandCursor)
@@ -736,6 +854,40 @@ class AppTk(QMainWindow):
 
         lang_layout.addLayout(lang_header_layout)
 
+        self.model_label = QLabel(self.t("whisper_model"))
+        self.model_label.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        self.model_label.setStyleSheet(
+            f"color: {self.colors['text_dark']}; background: transparent;"
+        )
+
+        self.model_help_btn = QPushButton("?")
+        self.model_help_btn.setFixedSize(16, 16)
+        self.model_help_btn.setCursor(Qt.PointingHandCursor)
+        self.model_help_btn.setToolTip(self.t("model_tooltip"))
+        self.model_help_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {self.colors['primary']};
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 9px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {self.colors['primary_hover']};
+            }}
+            QToolTip {{
+                background-color: {self.colors['card_bg']};
+                color: {self.colors['text_dark']};
+                border: 1px solid {self.colors['border']};
+                padding: 5px;
+                border-radius: 3px;
+                font-size: 10px;
+            }}
+        """
+        )
+
         self.lang_combo = QComboBox()
         self.lang_combo.addItems(
             [
@@ -747,11 +899,11 @@ class AppTk(QMainWindow):
                 "Indonesian",
             ]
         )
-        self.lang_combo.setFont(QFont("Segoe UI", 10))
-        self.lang_combo.setFixedHeight(40)
+        self.lang_combo.setFont(QFont("Segoe UI", 9))
+        self.lang_combo.setFixedHeight(36)
         # Allow combo to be reasonably sized but not force layout overflow
-        self.lang_combo.setMinimumWidth(160)
-        self.lang_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.lang_combo.setMinimumWidth(100)
+        self.lang_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.lang_combo.setStyleSheet(
             f"""
             QComboBox {{
@@ -816,15 +968,276 @@ class AppTk(QMainWindow):
             }}
         """
         )
-        lang_layout.addWidget(self.lang_combo, alignment=Qt.AlignLeft)
+
+        # Model combobox
+        self.model_combo = QComboBox()
+        self.model_combo.addItems(
+            [
+                self.t("model_base"),
+                self.t("model_tiny"),
+                self.t("model_small"),
+                self.t("model_medium"),
+                self.t("model_large"),
+            ]
+        )
+        self.model_combo.setCurrentIndex(0)
+        self.model_combo.setFont(QFont("Segoe UI", 9))
+        self.model_combo.setFixedHeight(36)
+        self.model_combo.setMinimumWidth(100)
+        self.model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.model_combo.setStyleSheet(
+            f"""
+            QComboBox {{
+                background-color: {self.colors['input_bg']};
+                border: 1px solid {self.colors['input_border']};
+                border-radius: 4px;
+                padding: 8px 12px;
+                padding-right: 35px;
+                color: {self.colors['text_dark']};
+            }}
+            QComboBox:hover {{
+                border: 1px solid {self.colors['primary']};
+            }}
+            QComboBox:focus {{
+                border: 2px solid {self.colors['primary']};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 25px;
+                border: none;
+                background: transparent;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-style: solid;
+                border-width: 6px 5px 0px 5px;
+                border-color: {self.colors['text_dark']} transparent transparent transparent;
+            }}
+            QComboBox::down-arrow:hover {{
+                border-color: {self.colors['primary']} transparent transparent transparent;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {self.colors['card_bg']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 4px;
+                padding: 4px;
+                selection-background-color: {self.colors['primary']};
+                selection-color: white;
+                outline: none;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 8px 12px;
+                border: 1px solid {self.colors['border']};
+                border-radius: 3px;
+                min-height: 30px;
+                margin: 2px;
+                background-color: {self.colors['card_bg']};
+                color: {self.colors['text_dark']};
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: {self.colors['primary_hover']};
+                color: white;
+                border: 1px solid {self.colors['primary']};
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background-color: {self.colors['primary']};
+                color: white;
+                border: 1px solid {self.colors['primary_dark']};
+            }}
+        """
+        )
+
+        combo_row_layout = QHBoxLayout()
+        combo_row_layout.setSpacing(12)
+        combo_row_layout.setContentsMargins(0, 0, 0, 0)
+
+        lang_column = QVBoxLayout()
+        lang_column.setSpacing(4)
+        lang_column.setContentsMargins(0, 0, 0, 0)
+
+        lang_col_header = QHBoxLayout()
+        lang_col_header.setSpacing(4)
+        lang_col_header.addWidget(self.lang_label)
+        lang_col_header.addWidget(self.help_btn)
+        lang_col_header.addStretch()
+        lang_column.addLayout(lang_col_header)
+        lang_column.addWidget(self.lang_combo)
+
+        combo_row_layout.addLayout(lang_column, 1)
+
+        model_column = QVBoxLayout()
+        model_column.setSpacing(4)
+        model_column.setContentsMargins(0, 0, 0, 0)
+
+        model_col_header = QHBoxLayout()
+        model_col_header.setSpacing(4)
+        model_col_header.addWidget(self.model_label)
+        model_col_header.addWidget(self.model_help_btn)
+        model_col_header.addStretch()
+        model_column.addLayout(model_col_header)
+        model_column.addWidget(self.model_combo)
+
+        combo_row_layout.addLayout(model_column, 1)
+
+        # Voice selection column
+        voice_column = QVBoxLayout()
+        voice_column.setSpacing(4)
+        voice_column.setContentsMargins(0, 0, 0, 0)
+
+        # Voice label
+        self.voice_label = QLabel(self.t("tts_voice"))
+        self.voice_label.setFont(QFont("Segoe UI", 9))
+        self.voice_label.setStyleSheet(
+            f"color: {self.colors['text_dark']}; background: transparent;"
+        )
+
+        # Voice help button
+        self.voice_help_btn = QPushButton("?")
+        self.voice_help_btn.setFixedSize(18, 18)
+        self.voice_help_btn.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        self.voice_help_btn.setCursor(Qt.PointingHandCursor)
+        self.voice_help_btn.setToolTip(self.t("voice_tooltip"))
+        self.voice_help_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {self.colors['primary']};
+                color: white;
+                border: none;
+                border-radius: 9px;
+            }}
+            QPushButton:hover {{
+                background-color: {self.colors['primary_hover']};
+            }}
+        """
+        )
+
+        # Voice combobox
+        self.voice_combo = QComboBox()
+        self.voice_combo.addItems(
+            [
+                self.t("voice_female"),
+                self.t("voice_male"),
+            ]
+        )
+        self.voice_combo.setCurrentIndex(0)  # Default to female voice
+        self.voice_combo.setFont(QFont("Segoe UI", 9))
+        self.voice_combo.setFixedHeight(36)
+        self.voice_combo.setMinimumWidth(100)
+        self.voice_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.voice_combo.setStyleSheet(
+            f"""
+            QComboBox {{
+                background-color: {self.colors['input_bg']};
+                border: 1px solid {self.colors['input_border']};
+                border-radius: 4px;
+                padding: 8px 12px;
+                padding-right: 35px;
+                color: {self.colors['text_dark']};
+            }}
+            QComboBox:hover {{
+                border: 1px solid {self.colors['primary']};
+            }}
+            QComboBox:focus {{
+                border: 2px solid {self.colors['primary']};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 25px;
+                border: none;
+                background: transparent;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-style: solid;
+                border-width: 6px 5px 0px 5px;
+                border-color: {self.colors['text_dark']} transparent transparent transparent;
+            }}
+            QComboBox::down-arrow:hover {{
+                border-color: {self.colors['primary']} transparent transparent transparent;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {self.colors['card_bg']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 4px;
+                padding: 4px;
+                selection-background-color: {self.colors['primary']};
+                selection-color: white;
+                outline: none;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 8px 12px;
+                border: 1px solid {self.colors['border']};
+                border-radius: 3px;
+                min-height: 30px;
+                margin: 2px;
+                background-color: {self.colors['card_bg']};
+                color: {self.colors['text_dark']};
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: {self.colors['primary_hover']};
+                color: white;
+                border: 1px solid {self.colors['primary']};
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background-color: {self.colors['primary']};
+                color: white;
+                border: 1px solid {self.colors['primary_dark']};
+            }}
+        """
+        )
+
+        voice_col_header = QHBoxLayout()
+        voice_col_header.setSpacing(4)
+        voice_col_header.addWidget(self.voice_label)
+        voice_col_header.addWidget(self.voice_help_btn)
+        voice_col_header.addStretch()
+        voice_column.addLayout(voice_col_header)
+        voice_column.addWidget(self.voice_combo)
+
+        combo_row_layout.addLayout(voice_column, 1)
+        combo_row_layout.addStretch()
+
+        lang_layout.addLayout(combo_row_layout)
 
         content_layout.addWidget(self.lang_card)
 
         # Action buttons
         btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(12)
+        btn_layout.setSpacing(8)
 
-        # The Start Processing button has been removed from the UI.
+        self.start_btn = QPushButton(self.t("start_processing"))
+        self.start_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.start_btn.setCursor(Qt.PointingHandCursor)
+        self.start_btn.setEnabled(False)
+        self.start_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {self.colors['success']};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 10px 20px;
+            }}
+            QPushButton:hover:enabled {{
+                background-color: {self.colors['success_hover']};
+            }}
+            QPushButton:pressed:enabled {{
+                background-color: #46A815;
+            }}
+            QPushButton:disabled {{
+                background-color: #95A5A6;
+                color: #CCCCCC;
+            }}
+        """
+        )
+        self.start_btn.clicked.connect(self.handle_start_stop_continue)
+        btn_layout.addWidget(self.start_btn)
 
         self.log_btn = QPushButton(self.t("view_logs"))
         self.log_btn.setFont(QFont("Segoe UI", 10))
@@ -892,6 +1305,30 @@ class AppTk(QMainWindow):
         )
         self.export_srt_btn.clicked.connect(self.start_export_srt)
         btn_layout.addWidget(self.export_srt_btn)
+
+        # Voiceover button - Create video with Vietnamese TTS
+        self.voiceover_btn = QPushButton(self.t("voiceover_btn"))
+        self.voiceover_btn.setFont(QFont("Segoe UI", 10))
+        self.voiceover_btn.setCursor(Qt.PointingHandCursor)
+        self.voiceover_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: #00ACC1;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 14px 20px;
+            }}
+            QPushButton:hover {{
+                background-color: #00BCD4;
+            }}
+            QPushButton:pressed {{
+                background-color: #0097A7;
+            }}
+        """
+        )
+        self.voiceover_btn.clicked.connect(self.start_voiceover)
+        btn_layout.addWidget(self.voiceover_btn)
 
         btn_layout.addStretch()
         # Download SRT button (hidden until temp_subtitles.srt is detected)
@@ -988,13 +1425,10 @@ class AppTk(QMainWindow):
 
     def update_theme(self):
         """Update all UI elements with new theme colors"""
-        # Update theme button icon
         self.theme_btn.setText("☀️" if self.current_theme == "dark" else "🌙")
 
-        # Update hover colors based on theme
         hover_color = "#E8E8E8" if self.current_theme == "light" else "#3A3A3A"
 
-        # Update main widget background
         self.centralWidget().setStyleSheet(
             f"""
             QWidget {{
@@ -1016,6 +1450,9 @@ class AppTk(QMainWindow):
             f"color: {self.colors['text_dark']}; background: transparent;"
         )
         self.lang_label.setStyleSheet(
+            f"color: {self.colors['text_dark']}; background: transparent;"
+        )
+        self.model_label.setStyleSheet(
             f"color: {self.colors['text_dark']}; background: transparent;"
         )
         self.logs_label.setStyleSheet(
@@ -1167,7 +1604,225 @@ class AppTk(QMainWindow):
         """
         )
 
-        # Export button uses its dedicated style (below).
+        # Update model help button
+        self.model_help_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {self.colors['primary']};
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 9px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {self.colors['primary_hover']};
+            }}
+            QToolTip {{
+                background-color: {self.colors['card_bg']};
+                color: {self.colors['text_dark']};
+                border: 1px solid {self.colors['border']};
+                padding: 5px;
+                border-radius: 3px;
+                font-size: 10px;
+            }}
+        """
+        )
+
+        # Update model combo box
+        self.model_combo.setStyleSheet(
+            f"""
+            QComboBox {{
+                background-color: {self.colors['input_bg']};
+                border: 1px solid {self.colors['input_border']};
+                border-radius: 4px;
+                padding: 8px 12px;
+                padding-right: 35px;
+                color: {self.colors['text_dark']};
+            }}
+            QComboBox:hover {{
+                border: 1px solid {self.colors['primary']};
+            }}
+            QComboBox:focus {{
+                border: 2px solid {self.colors['primary']};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 25px;
+                border: none;
+                background: transparent;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-style: solid;
+                border-width: 6px 5px 0px 5px;
+                border-color: {self.colors['text_dark']} transparent transparent transparent;
+            }}
+            QComboBox::down-arrow:hover {{
+                border-color: {self.colors['primary']} transparent transparent transparent;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {self.colors['card_bg']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 4px;
+                padding: 4px;
+                selection-background-color: {self.colors['primary']};
+                selection-color: white;
+                outline: none;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 8px 12px;
+                border: 1px solid {self.colors['border']};
+                border-radius: 3px;
+                min-height: 30px;
+                margin: 2px;
+                background-color: {self.colors['card_bg']};
+                color: {self.colors['text_dark']};
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: {self.colors['primary_hover']};
+                color: white;
+                border: 1px solid {self.colors['primary']};
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background-color: {self.colors['primary']};
+                color: white;
+                border: 1px solid {self.colors['primary_dark']};
+            }}
+        """
+        )
+
+        # Update voice combo box
+        self.voice_combo.setStyleSheet(
+            f"""
+            QComboBox {{
+                background-color: {self.colors['input_bg']};
+                border: 1px solid {self.colors['input_border']};
+                border-radius: 4px;
+                padding: 8px 12px;
+                padding-right: 35px;
+                color: {self.colors['text_dark']};
+            }}
+            QComboBox:hover {{
+                border: 1px solid {self.colors['primary']};
+            }}
+            QComboBox:focus {{
+                border: 2px solid {self.colors['primary']};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 25px;
+                border: none;
+                background: transparent;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-style: solid;
+                border-width: 6px 5px 0px 5px;
+                border-color: {self.colors['text_dark']} transparent transparent transparent;
+            }}
+            QComboBox::down-arrow:hover {{
+                border-color: {self.colors['primary']} transparent transparent transparent;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {self.colors['card_bg']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 4px;
+                padding: 4px;
+                selection-background-color: {self.colors['primary']};
+                selection-color: white;
+                outline: none;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 8px 12px;
+                border: 1px solid {self.colors['border']};
+                border-radius: 3px;
+                min-height: 30px;
+                margin: 2px;
+                background-color: {self.colors['card_bg']};
+                color: {self.colors['text_dark']};
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: {self.colors['primary_hover']};
+                color: white;
+                border: 1px solid {self.colors['primary']};
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background-color: {self.colors['primary']};
+                color: white;
+                border: 1px solid {self.colors['primary_dark']};
+            }}
+        """
+        )
+
+        # Update voice label
+        self.voice_label.setStyleSheet(
+            f"color: {self.colors['text_dark']}; background: transparent;"
+        )
+
+        # Update voice help button
+        self.voice_help_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {self.colors['primary']};
+                color: white;
+                border: none;
+                border-radius: 9px;
+            }}
+            QPushButton:hover {{
+                background-color: {self.colors['primary_hover']};
+            }}
+        """
+        )
+
+        # Update start button (check current state)
+        current_text = self.start_btn.text()
+        if "Stop" in current_text or "Dừng" in current_text:
+            self.start_btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: {self.colors['danger']};
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 10px 20px;
+                }}
+                QPushButton:hover {{
+                    background-color: #FF4D4F;
+                }}
+                QPushButton:pressed {{
+                    background-color: #CF1322;
+                }}
+            """
+            )
+        else:
+            self.start_btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: {self.colors['success']};
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 10px 20px;
+                }}
+                QPushButton:hover:enabled {{
+                    background-color: {self.colors['success_hover']};
+                }}
+                QPushButton:pressed:enabled {{
+                    background-color: #46A815;
+                }}
+                QPushButton:disabled {{
+                    background-color: #95A5A6;
+                    color: #CCCCCC;
+                }}
+            """
+            )
 
         self.log_btn.setStyleSheet(
             f"""
@@ -1216,6 +1871,24 @@ class AppTk(QMainWindow):
             }}
             QPushButton:pressed {{
                 background-color: #7D3C98;
+            }}
+        """
+        )
+
+        self.voiceover_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: #00ACC1;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 14px 20px;
+            }}
+            QPushButton:hover {{
+                background-color: #00BCD4;
+            }}
+            QPushButton:pressed {{
+                background-color: #0097A7;
             }}
         """
         )
@@ -1362,12 +2035,52 @@ class AppTk(QMainWindow):
         self.browse_btn.setText(self.t("browse"))
         self.lang_label.setText(self.t("source_language"))
         self.help_btn.setToolTip(self.t("language_tooltip"))
+        self.model_label.setText(self.t("whisper_model"))
+        self.model_help_btn.setToolTip(self.t("model_tooltip"))
+        self.voice_label.setText(self.t("tts_voice"))
+        self.voice_help_btn.setToolTip(self.t("voice_tooltip"))
 
-        # Ensure Export button shows correct label
-        self.export_srt_btn.setText(self.t("export_srt"))
+        # Update model combobox items
+        current_model_index = self.model_combo.currentIndex()
+        self.model_combo.clear()
+        self.model_combo.addItems(
+            [
+                self.t("model_base"),
+                self.t("model_tiny"),
+                self.t("model_small"),
+                self.t("model_medium"),
+                self.t("model_large"),
+            ]
+        )
+        self.model_combo.setCurrentIndex(current_model_index)
+
+        # Update voice combobox items
+        current_voice_index = self.voice_combo.currentIndex()
+        self.voice_combo.clear()
+        self.voice_combo.addItems(
+            [
+                self.t("voice_female"),
+                self.t("voice_male"),
+            ]
+        )
+        self.voice_combo.setCurrentIndex(current_voice_index)
+
+        # Update button text based on current state
+        current_btn_text = self.start_btn.text()
+        if "Start" in current_btn_text or "Bắt" in current_btn_text:
+            self.start_btn.setText(self.t("start_processing"))
+            self.button_state = "start"
+        elif "Stop" in current_btn_text or "Dừng" in current_btn_text:
+            self.start_btn.setText(self.t("stop"))
+            self.button_state = "stop"
+        elif "Continue" in current_btn_text or "Tiếp" in current_btn_text:
+            self.start_btn.setText(self.t("continue"))
+            self.button_state = "continue"
+
         self.log_btn.setText(self.t("view_logs"))
         self.reset_btn.setText(self.t("reset"))
         self.export_srt_btn.setText(self.t("export_srt"))
+        self.voiceover_btn.setText(self.t("voiceover_btn"))
         self.download_srt_btn.setText(self.t("download_srt"))
         self.logs_label.setText(self.t("processing_logs"))
 
@@ -1375,6 +2088,15 @@ class AppTk(QMainWindow):
         current_status = self.status_label.text()
         if "Ready" in current_status or "Sẵn sàng" in current_status:
             self.status_label.setText(self.t("ready"))
+        elif "Exporting" in current_status or "xuất" in current_status:
+            self.status_label.setText(self.t("exporting"))
+        elif "Processing" in current_status or "Đang xử lý" in current_status:
+            self.status_label.setText(self.t("processing"))
+        elif (
+            "Creating voiceover" in current_status
+            or "video thuyết minh" in current_status
+        ):
+            self.status_label.setText(self.t("voiceover_processing"))
 
         # Update runtime label
         runtime_text = self.runtime_label.text()
@@ -1428,14 +2150,18 @@ class AppTk(QMainWindow):
         )
         if path:
             self.entry.setText(path)
-            self.export_srt_btn.setEnabled(True)
+            self.start_btn.setEnabled(True)
             self.status_label.setText(f"{self.t('selected')}: {Path(path).name}")
             self.log.append(f"{self.t('video_selected')}: {path}")
 
     def handle_start_stop_continue(self):
         """Handle Start/Stop/Continue button click"""
-        # This handler is deprecated — Start button was removed. No-op.
-        return
+        if self.button_state == "start":
+            self.start_processing()
+        elif self.button_state == "stop":
+            self.pause_processing()
+        elif self.button_state == "continue":
+            self.resume_processing()
 
     def start_export_srt(self):
         """Start exporting SRT file only (without creating video)"""
@@ -1446,8 +2172,9 @@ class AppTk(QMainWindow):
             )
             return
 
-        # Disable the Export button during processing
+        # Disable buttons during processing
         self.export_srt_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
         self.status_label.setText(self.t("exporting"))
         self.log.clear()
         self.log.append(f"{self.t('starting_export')}\n")
@@ -1463,6 +2190,13 @@ class AppTk(QMainWindow):
             "Indonesian": "id",
         }
         selected_code = lang_map.get(selected_label, "en")
+
+        # Read selected model from UI
+        model_index = self.model_combo.currentIndex()
+        model_list = ["base", "tiny", "small", "medium", "large"]
+        selected_model = (
+            model_list[model_index] if 0 <= model_index < len(model_list) else "base"
+        )
 
         # Reset pause state
         self.pause_event.set()
@@ -1480,6 +2214,7 @@ class AppTk(QMainWindow):
                 input_path,
                 self.msg_queue,
                 selected_code,
+                selected_model,
                 self.pause_event,
                 current_process_holder,
                 self.stop_event,
@@ -1495,9 +2230,234 @@ class AppTk(QMainWindow):
         except Exception:
             self.processing_start_time = None
 
-    # `start_processing` removed — button hidden and start functionality deprecated.
+    def start_voiceover(self):
+        """Start creating voiceover video with Vietnamese TTS"""
+        input_path = self.entry.text()
+        if not input_path:
+            QMessageBox.warning(
+                self, self.t("no_file_selected"), self.t("select_voiceover_warning")
+            )
+            return
 
-    # Pause/resume UI removed — export is single-action; worker still supports pause via events.
+        # Disable buttons during processing
+        self.voiceover_btn.setEnabled(False)
+        self.export_srt_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.status_label.setText(self.t("voiceover_processing"))
+        self.log.clear()
+        self.log.append(f"{self.t('voiceover_starting')}\n")
+
+        # Read selected language from UI
+        selected_label = self.lang_combo.currentText()
+        lang_map = {
+            "English": "en",
+            "Japanese": "ja",
+            "Chinese (Simplified)": "zh",
+            "Korean": "ko",
+            "Thai": "th",
+            "Indonesian": "id",
+        }
+        selected_code = lang_map.get(selected_label, "en")
+
+        # Read selected model from UI
+        model_index = self.model_combo.currentIndex()
+        model_list = ["base", "tiny", "small", "medium", "large"]
+        selected_model = (
+            model_list[model_index] if 0 <= model_index < len(model_list) else "base"
+        )
+
+        # Read selected voice from UI
+        voice_index = self.voice_combo.currentIndex()
+        selected_voice = "female" if voice_index == 0 else "male"
+
+        # Reset pause state
+        self.pause_event.set()
+        self.is_paused = False
+        self.paused_elapsed_time = 0
+        self.stop_event.clear()
+
+        # Create holder for subprocess reference
+        current_process_holder = [None]
+        self.current_process = current_process_holder
+
+        self.worker = threading.Thread(
+            target=worker_process_voiceover,
+            args=(
+                input_path,
+                self.msg_queue,
+                selected_code,
+                selected_model,
+                self.pause_event,
+                current_process_holder,
+                self.stop_event,
+                selected_voice,
+            ),
+        )
+        self.worker.daemon = True
+        self.worker.start()
+
+        # Start runtime timer
+        try:
+            self.processing_start_time = time.time()
+            self.runtime_timer.start(1000)
+        except Exception:
+            self.processing_start_time = None
+
+    def start_processing(self):
+        """Start the processing task"""
+        input_path = self.entry.text()
+        if not input_path:
+            QMessageBox.warning(
+                self, self.t("no_file_selected"), self.t("select_video_warning")
+            )
+            return
+
+        # Change button to Stop
+        self.start_btn.setText(self.t("stop"))
+        self.button_state = "stop"
+        self.start_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {self.colors['danger']};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 10px 20px;
+            }}
+            QPushButton:hover {{
+                background-color: #FF4D4F;
+            }}
+            QPushButton:pressed {{
+                background-color: #CF1322;
+            }}
+        """
+        )
+        self.status_label.setText(self.t("processing"))
+        self.log.clear()
+        self.log.append(f"{self.t('starting')}\n")
+
+        # Read selected language from UI and pass to worker
+        selected_label = self.lang_combo.currentText()
+        # Map readable label to language code expected by the processing code
+        lang_map = {
+            "English": "en",
+            "Japanese": "ja",
+            "Chinese (Simplified)": "zh",
+            "Korean": "ko",
+            "Thai": "th",
+            "Indonesian": "id",
+        }
+        selected_code = lang_map.get(selected_label, "en")
+
+        # Read selected model from UI
+        model_index = self.model_combo.currentIndex()
+        model_list = ["base", "tiny", "small", "medium", "large"]
+        selected_model = (
+            model_list[model_index] if 0 <= model_index < len(model_list) else "base"
+        )
+
+        # Reset pause state
+        self.pause_event.set()
+        self.is_paused = False
+        self.paused_elapsed_time = 0
+        self.stop_event.clear()  # Clear stop flag
+
+        # Create holder for subprocess reference
+        current_process_holder = [None]
+        self.current_process = current_process_holder
+
+        self.worker = threading.Thread(
+            target=worker_process,
+            args=(
+                input_path,
+                self.msg_queue,
+                selected_code,
+                selected_model,
+                self.pause_event,
+                current_process_holder,
+                self.stop_event,
+            ),
+        )
+        self.worker.daemon = True
+        self.worker.start()
+        # Start runtime timer
+        try:
+            self.processing_start_time = time.time()
+            self.runtime_timer.start(1000)
+        except Exception:
+            self.processing_start_time = None
+
+    def pause_processing(self):
+        """Pause the processing task"""
+        if self.worker and self.worker.is_alive():
+            self.pause_event.clear()  # Signal worker to pause
+            self.is_paused = True
+
+            # Save elapsed time when pausing
+            if self.processing_start_time:
+                self.paused_elapsed_time = time.time() - self.processing_start_time
+
+            # Stop runtime timer
+            self.runtime_timer.stop()
+
+            # Change button to Continue
+            self.start_btn.setText(self.t("continue"))
+            self.button_state = "continue"
+            self.start_btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: {self.colors['success']};
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 10px 20px;
+                }}
+                QPushButton:hover {{
+                    background-color: {self.colors['success_hover']};
+                }}
+                QPushButton:pressed {{
+                    background-color: #46A815;
+                }}
+            """
+            )
+            self.status_label.setText(self.t("paused"))
+            self.log.append(f"\n{self.t('paused_user')}")
+
+    def resume_processing(self):
+        """Resume the processing task"""
+        if self.worker and self.worker.is_alive():
+            self.pause_event.set()  # Signal worker to resume
+            self.is_paused = False
+
+            # Adjust start time to account for paused duration
+            if self.processing_start_time:
+                self.processing_start_time = time.time() - self.paused_elapsed_time
+
+            # Restart runtime timer
+            self.runtime_timer.start(1000)
+
+            # Change button back to Stop
+            self.start_btn.setText(self.t("stop"))
+            self.button_state = "stop"
+            self.start_btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: {self.colors['danger']};
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 10px 20px;
+                }}
+                QPushButton:hover {{
+                    background-color: #FF4D4F;
+                }}
+                QPushButton:pressed {{
+                    background-color: #CF1322;
+                }}
+            """
+            )
+            self.status_label.setText(self.t("resumed"))
+            self.log.append(f"{self.t('resumed')}\n")
 
     def open_log_file(self):
         """Open the log file with default text editor"""
@@ -1649,10 +2609,31 @@ class AppTk(QMainWindow):
                             self.runtime_timer.stop()
                         except Exception:
                             pass
-                    # Restore export button state
+
+                    # Restore start button
                     self.is_paused = False
+                    self.start_btn.setEnabled(True)
                     self.export_srt_btn.setEnabled(True)
-                    self.export_srt_btn.setText(self.t("export_srt"))
+                    self.voiceover_btn.setEnabled(True)
+                    self.start_btn.setText(self.t("start_processing"))
+                    self.button_state = "start"
+                    self.start_btn.setStyleSheet(
+                        f"""
+                        QPushButton {{
+                            background-color: {self.colors['success']};
+                            color: white;
+                            border: none;
+                            border-radius: 4px;
+                            padding: 10px 20px;
+                        }}
+                        QPushButton:hover:enabled {{
+                            background-color: {self.colors['success_hover']};
+                        }}
+                        QPushButton:pressed:enabled {{
+                            background-color: #46A815;
+                        }}
+                    """
+                    )
                 elif msg == "__PAUSED__":
                     # Handle paused notification from worker
                     pass
@@ -1725,26 +2706,26 @@ class AppTk(QMainWindow):
 
         # Clear UI fields
         self.entry.clear()
-        # Reset export button state
-        try:
-            self.export_srt_btn.setEnabled(False)
-            self.export_srt_btn.setText(self.t("export_srt"))
-            self.export_srt_btn.setStyleSheet(
-                f"""
-                QPushButton {{
-                    background-color: {self.colors['primary']};
-                    color: white;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 14px 20px;
-                }}
-                QPushButton:hover {{
-                    background-color: {self.colors['primary_hover']};
-                }}
-            """
-            )
-        except Exception:
-            pass
+        self.start_btn.setEnabled(False)
+        self.start_btn.setText(self.t("start_processing"))
+        self.button_state = "start"
+        self.start_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {self.colors['success']};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 10px 20px;
+            }}
+            QPushButton:hover:enabled {{
+                background-color: {self.colors['success_hover']};
+            }}
+            QPushButton:pressed:enabled {{
+                background-color: #46A815;
+            }}
+        """
+        )
 
         # Clear logs and status
         self.log.clear()

@@ -27,7 +27,13 @@ except ImportError:
 
 # Try to import Transformers for local neural translation (offline if models are cached locally)
 try:
-    from transformers import MarianMTModel, MarianTokenizer, pipeline
+    from transformers import (
+        MarianMTModel,
+        MarianTokenizer,
+        AutoTokenizer,
+        AutoModelForSeq2SeqLM,
+        pipeline,
+    )
 
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
@@ -219,36 +225,83 @@ class TranslationService:
     def _setup_local_models(self) -> None:
         """Setup local neural translation models using Transformers.
 
-        We load separate models for different language directions so that
-        Japanese → Vietnamese can use a two-step offline pipeline
-        (JA→EN then EN→VI) when available.
+        Now using NLLB-200-distilled-600M for better support of long texts.
+        Max token limit: 1024 (double of opus-mt's 512).
+        Supports direct JA→VI and EN→VI translation.
         """
         try:
-            # Use free Helsinki-NLP models for translation
-            model_configs = [
-                ("en", "vi", "Helsinki-NLP/opus-mt-en-vi"),  # EN → VI
-                ("ja", "en", "Helsinki-NLP/opus-mt-ja-en"),  # JA → EN
-            ]
+            # Use NLLB-200-distilled-600M for high-quality offline translation
+            # This model supports 200+ languages including JA→VI directly
+            model_name = "facebook/nllb-200-distilled-600M"
 
-            for src_lang, tgt_lang, model_name in model_configs:
-                try:
-                    logger.info(f"Loading local translation model: {model_name}")
-                    tokenizer = MarianTokenizer.from_pretrained(model_name)
-                    model = MarianMTModel.from_pretrained(model_name)
+            try:
+                logger.info(f"Loading NLLB translation model: {model_name}")
+                logger.info("This may take a moment on first load...")
 
-                    self.local_models[f"local_{src_lang}_{tgt_lang}"] = {
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+                # Store tokenizer and model for direct access
+                self.nllb_tokenizer = tokenizer
+                self.nllb_model = model
+
+                # NLLB language codes mapping
+                self.nllb_lang_codes = {
+                    "en": "eng_Latn",
+                    "vi": "vie_Latn",
+                    "ja": "jpn_Jpan",
+                    "zh": "zho_Hans",
+                    "ko": "kor_Hang",
+                    "th": "tha_Thai",
+                    "id": "ind_Latn",
+                }
+
+                # Register NLLB for multiple language pairs
+                for src in ["en", "ja", "zh", "ko"]:
+                    self.local_models[f"nllb_{src}_vi"] = {
                         "tokenizer": tokenizer,
                         "model": model,
-                        "pipeline": pipeline(
-                            "translation", model=model, tokenizer=tokenizer
-                        ),
+                        "src_lang": src,
+                        "tgt_lang": "vi",
+                        "max_length": 1024,  # NLLB max token limit
                     }
+                    self.translators[f"nllb_{src}_vi"] = "nllb"
 
-                    self.translators[f"local_{src_lang}_{tgt_lang}"] = "local"
-                    logger.info(f"Local model {model_name} loaded successfully")
+                logger.info(f"NLLB model loaded successfully (max_length: 1024 tokens)")
+                logger.info(f"Supported translations: EN→VI, JA→VI, ZH→VI, KO→VI")
 
-                except Exception as e:
-                    logger.warning(f"Failed to load model {model_name}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to load NLLB model: {e}")
+                logger.info("Falling back to lighter models...")
+
+                # Fallback to opus-mt models if NLLB fails
+                fallback_configs = [
+                    ("en", "vi", "Helsinki-NLP/opus-mt-en-vi"),
+                    ("ja", "en", "Helsinki-NLP/opus-mt-ja-en"),
+                ]
+
+                for src_lang, tgt_lang, fallback_model in fallback_configs:
+                    try:
+                        logger.info(f"Loading fallback model: {fallback_model}")
+                        tokenizer = MarianTokenizer.from_pretrained(fallback_model)
+                        model = MarianMTModel.from_pretrained(fallback_model)
+
+                        self.local_models[f"local_{src_lang}_{tgt_lang}"] = {
+                            "tokenizer": tokenizer,
+                            "model": model,
+                            "pipeline": pipeline(
+                                "translation", model=model, tokenizer=tokenizer
+                            ),
+                            "max_length": 512,
+                        }
+
+                        self.translators[f"local_{src_lang}_{tgt_lang}"] = "local"
+                        logger.info(f"Fallback model {fallback_model} loaded")
+
+                    except Exception as e2:
+                        logger.warning(
+                            f"Failed to load fallback model {fallback_model}: {e2}"
+                        )
 
         except Exception as e:
             logger.warning(f"Failed to setup local models: {e}")
@@ -336,44 +389,39 @@ class TranslationService:
 
         # Batch translate uncached texts
         if texts_to_translate:
-            if source_language == "ja":
-                # JA->VI pipeline
-                for i, text in texts_to_translate.items():
-                    result = self._translate_ja_to_vi_offline(text)
-                    if result:
-                        self.cache.set(result)
-                        results[i] = result
-            else:
-                # EN->VI batch
-                batch_texts = list(texts_to_translate.values())
-                batch_indices = list(texts_to_translate.keys())
+            batch_texts = list(texts_to_translate.values())
+            batch_indices = list(texts_to_translate.keys())
 
-                translated = self._batch_translate_en_vi(batch_texts)
-                for idx, trans_text in zip(batch_indices, translated):
-                    if trans_text:
-                        result = TranslationResult(
-                            original_text=texts_to_translate[idx],
-                            translated_text=trans_text,
-                            source_language=source_language,
-                            target_language=self.target_language,
-                            confidence=0.9,
-                            timestamp=datetime.now(),
-                            service_used="local_en_vi_batch",
-                        )
-                        self.cache.set(result)
-                        results[idx] = result
+            # Use NLLB for batch translation if available
+            translated = self._batch_translate_with_nllb(batch_texts, source_language)
+
+            for idx, trans_text in zip(batch_indices, translated):
+                if trans_text:
+                    result = TranslationResult(
+                        original_text=texts_to_translate[idx],
+                        translated_text=trans_text,
+                        source_language=source_language,
+                        target_language=self.target_language,
+                        confidence=0.9,
+                        timestamp=datetime.now(),
+                        service_used=f"nllb_{source_language}_vi_batch",
+                    )
+                    self.cache.set(result)
+                    results[idx] = result
 
         return results
 
-    def _batch_translate_en_vi(
-        self, texts: List[str], batch_size: int = 8
+    def _batch_translate_with_nllb(
+        self, texts: List[str], source_lang: str = "en", batch_size: int = 8
     ) -> List[str]:
         """
-        Batch translate EN->VI using local model for better throughput.
+        Batch translate using NLLB model with automatic chunking for long texts.
+        Optimized for video dài với batch size nhỏ để xử lý ổn định.
 
         Args:
             texts: List of texts to translate
-            batch_size: Number of texts per batch
+            source_lang: Source language code (en, ja, zh, ko, etc.)
+            batch_size: Number of texts per batch (default 8 for stability)
 
         Returns:
             List of translated texts
@@ -381,29 +429,163 @@ class TranslationService:
         if not texts:
             return []
 
-        model_info = self.local_models.get("local_en_vi")
-        if not model_info:
-            # Fallback to Argos
-            return [self._translate_with_argos(text, "en") for text in texts]
+        # Check if NLLB is available
+        if not hasattr(self, "nllb_model") or not hasattr(self, "nllb_tokenizer"):
+            # Fallback to opus-mt if available
+            model_info = self.local_models.get("local_en_vi")
+            if model_info and "pipeline" in model_info:
+                results = []
+                for i in range(0, len(texts), batch_size):
+                    batch = texts[i : i + batch_size]
+                    try:
+                        with self._model_lock:
+                            batch_results = model_info["pipeline"](
+                                batch, batch_size=len(batch)
+                            )
+                        results.extend([r["translation_text"] for r in batch_results])
+                    except Exception as e:
+                        logger.warning(f"Opus-MT batch failed: {e}")
+                        results.extend(batch)
+                return results
 
+            # Final fallback to Argos
+            return [self._translate_with_argos(text, source_lang) for text in texts]
+
+        # Use NLLB for batch translation
         results = []
+        src_code = self.nllb_lang_codes.get(source_lang, "eng_Latn")
+        tgt_code = self.nllb_lang_codes.get("vi", "vie_Latn")
 
-        # Process in batches
+        # Process in small batches for stability with long videos
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
 
-            # Lock only during inference
-            with self._model_lock:
-                try:
-                    pipeline = model_info["pipeline"]
-                    batch_results = pipeline(batch, batch_size=len(batch))
-                    results.extend([r["translation_text"] for r in batch_results])
-                except Exception as e:
-                    logger.warning(f"Batch translation failed: {e}")
-                    # Fallback to individual
-                    results.extend(batch)
+            try:
+                # Set source language
+                self.nllb_tokenizer.src_lang = src_code
+
+                # Tokenize batch OUTSIDE lock
+                inputs = self.nllb_tokenizer(
+                    batch,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=1024,  # NLLB supports longer texts
+                )
+
+                # Get target language token ID
+                forced_bos_token_id = self.nllb_tokenizer.convert_tokens_to_ids(
+                    tgt_code
+                )
+
+                # Lock ONLY during model inference
+                with self._model_lock:
+                    translated_tokens = self.nllb_model.generate(
+                        **inputs,
+                        forced_bos_token_id=forced_bos_token_id,
+                        max_length=1024,
+                        num_beams=4,  # Balance quality vs speed
+                        early_stopping=True,
+                    )
+
+                # Decode OUTSIDE lock
+                batch_translations = self.nllb_tokenizer.batch_decode(
+                    translated_tokens, skip_special_tokens=True
+                )
+
+                results.extend(batch_translations)
+
+            except Exception as e:
+                logger.warning(f"NLLB batch translation failed: {e}")
+                # Fallback: translate individually with chunking
+                for text in batch:
+                    trans = self._translate_with_nllb(text, source_lang, "vi")
+                    results.append(trans if trans else text)
 
         return results
+
+    def _translate_with_nllb(
+        self, text: str, src_lang: str, tgt_lang: str = "vi"
+    ) -> Optional[str]:
+        """Dịch văn bản sử dụng NLLB model với xử lý tự động chia chunk.
+
+        Args:
+            text: Văn bản cần dịch
+            src_lang: Mã ngôn ngữ nguồn (en, ja, zh, ko, ...)
+            tgt_lang: Mã ngôn ngữ đích (mặc định vi)
+
+        Returns:
+            Văn bản đã dịch hoặc None nếu thất bại
+        """
+        if not hasattr(self, "nllb_model") or not hasattr(self, "nllb_tokenizer"):
+            return None
+
+        try:
+            # Lấy NLLB language codes
+            src_code = self.nllb_lang_codes.get(src_lang, "eng_Latn")
+            tgt_code = self.nllb_lang_codes.get(tgt_lang, "vie_Latn")
+
+            # Chia văn bản thành chunks nếu quá dài (an toàn với limit 1024)
+            chunks = self._split_text_into_chunks(text, max_tokens=900)
+
+            if len(chunks) > 1:
+                logger.info(f"Text split into {len(chunks)} chunks for translation")
+
+            translated_chunks = []
+
+            for i, chunk in enumerate(chunks):
+                try:
+                    # Set source language
+                    self.nllb_tokenizer.src_lang = src_code
+
+                    # Prepare inputs OUTSIDE lock
+                    inputs = self.nllb_tokenizer(
+                        chunk,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=1024,
+                    )
+
+                    # Get target language token ID
+                    forced_bos_token_id = self.nllb_tokenizer.convert_tokens_to_ids(
+                        tgt_code
+                    )
+
+                    # Lock ONLY during model inference (critical section)
+                    with self._model_lock:
+                        translated_tokens = self.nllb_model.generate(
+                            **inputs,
+                            forced_bos_token_id=forced_bos_token_id,
+                            max_length=1024,
+                        )
+
+                    # Decode OUTSIDE lock
+                    translated_text = self.nllb_tokenizer.batch_decode(
+                        translated_tokens, skip_special_tokens=True
+                    )[0]
+
+                    translated_chunks.append(translated_text)
+
+                    if len(chunks) > 1:
+                        logger.debug(f"Chunk {i+1}/{len(chunks)} translated")
+
+                except Exception as e:
+                    logger.warning(f"Failed to translate chunk {i+1}: {e}")
+                    # Fallback: giữ nguyên chunk gốc
+                    translated_chunks.append(chunk)
+
+            # Ghép các chunks lại
+            final_translation = " ".join(translated_chunks)
+
+            # Clean up overlapping parts nếu có
+            final_translation = re.sub(r"\s+", " ", final_translation).strip()
+
+            return final_translation
+
+        except Exception as e:
+            logger.error(f"NLLB translation failed: {e}")
+            return None
 
     def _translate_with_argos(self, text: str, source_lang: str) -> str:
         """Translate using Argos without full result object."""
@@ -472,19 +654,46 @@ class TranslationService:
                 return result
 
         # General case: try translation services in order of preference (OFFLINE only)
-        service_priority = [
-            "local_en_vi",  # Local neural model (fastest, no internet)
-            "argos_offline",  # Offline rule-based / statistical
-        ]
-
+        # Priority: NLLB (best quality) → opus-mt → Argos (fallback)
         result = None
-        for service_name in service_priority:
-            if service_name in self.translators:
-                result = self._translate_with_service(
-                    service_name, cleaned_text, source_language
-                )
-                if result:
-                    break
+
+        # 1. Try NLLB first (highest quality, supports long texts)
+        if hasattr(self, "nllb_model"):
+            nllb_key = f"nllb_{source_language}_vi"
+            if nllb_key in self.translators:
+                try:
+                    translated_text = self._translate_with_nllb(
+                        cleaned_text, source_language, self.target_language
+                    )
+                    if translated_text:
+                        result = TranslationResult(
+                            original_text=cleaned_text,
+                            translated_text=translated_text,
+                            source_language=source_language,
+                            target_language=self.target_language,
+                            confidence=0.95,  # NLLB high confidence
+                            timestamp=datetime.now(),
+                            service_used=nllb_key,
+                        )
+                        logger.debug(f"Translated with NLLB: {source_language}→vi")
+                except Exception as e:
+                    logger.warning(f"NLLB translation failed, trying fallback: {e}")
+
+        # 2. Fallback to opus-mt or Argos if NLLB fails
+        if not result:
+            service_priority = [
+                "local_en_vi",  # opus-mt fallback
+                "argos_offline",  # Argos fallback
+            ]
+
+            for service_name in service_priority:
+                if service_name in self.translators:
+                    result = self._translate_with_service(
+                        service_name, cleaned_text, source_language
+                    )
+                    if result:
+                        logger.debug(f"Used fallback service: {service_name}")
+                        break
 
         # Cache successful translation
         if result:
@@ -497,41 +706,53 @@ class TranslationService:
 
         return result
 
-    # NOTE: Previous versions implemented a special JA->VI pipeline that used
-    # online services. We now provide an OFFLINE-ONLY JA→VI pipeline using
-    # local Transformers models when available.
-
     def _translate_ja_to_vi_offline(self, text: str) -> Optional[TranslationResult]:
         """Translate Japanese to Vietnamese using offline models only.
 
-        Pipeline:
-        1) JA → EN using local_ja_en model (if available)
-        2) EN → VI using local_en_vi model (if available)
-
-        If one of the models is missing, this falls back to Argos Translate
-        (JA→VI via its own installed packages) when possible.
+        Priority:
+        1) NLLB direct JA→VI (best quality, supports long texts)
+        2) Two-step JA→EN→VI with opus-mt models
+        3) Argos Translate JA→VI (last resort)
         """
         try:
+            # 1. Try NLLB direct JA→VI (most accurate)
+            if hasattr(self, "nllb_model"):
+                try:
+                    logger.debug("Trying NLLB direct JA→VI translation")
+                    vi_text = self._translate_with_nllb(text, "ja", "vi")
+
+                    if vi_text:
+                        return TranslationResult(
+                            original_text=text,
+                            translated_text=vi_text,
+                            source_language="ja",
+                            target_language="vi",
+                            confidence=0.95,  # NLLB highest confidence
+                            timestamp=datetime.now(),
+                            service_used="nllb_ja_vi_direct",
+                        )
+                except Exception as e:
+                    logger.warning(f"NLLB JA→VI failed, trying fallback: {e}")
+
+            # 2. Fallback: Two-step JA→EN→VI with opus-mt models
             ja_en_key = "local_ja_en"
             en_vi_key = "local_en_vi"
 
             ja_en = self.local_models.get(ja_en_key)
             en_vi = self.local_models.get(en_vi_key)
 
-            # Two-step JA→EN→VI with local Transformers models
             if ja_en and en_vi:
-                logger.debug("Using local JA→EN then EN→VI pipeline")
+                logger.debug("Using fallback JA→EN→VI pipeline")
 
-                # Reduce lock scope: only lock during actual inference
                 ja_en_pipe = ja_en["pipeline"]
                 en_vi_pipe = en_vi["pipeline"]
 
-                # Step 1: JA→EN (lock only during inference)
+                # Step 1: JA→EN
                 with self._model_lock:
                     en_res = ja_en_pipe(text)
                 en_text = en_res[0]["translation_text"] if en_res else text
 
-                # Step 2: EN→VI (lock only during inference)
+                # Step 2: EN→VI
                 with self._model_lock:
                     vi_res = en_vi_pipe(en_text)
                 vi_text = vi_res[0]["translation_text"] if vi_res else en_text
@@ -543,13 +764,13 @@ class TranslationService:
                     target_language="vi",
                     confidence=0.85,
                     timestamp=datetime.now(),
-                    service_used="local_ja_en+local_en_vi",
+                    service_used="opus_ja_en+en_vi",
                 )
 
-            # Fallback: Argos Translate JA→VI directly if packages exist
+            # 3. Last resort: Argos Translate JA→VI
             if ARGOS_AVAILABLE:
                 try:
-                    logger.debug("Falling back to Argos JA→VI if available")
+                    logger.debug("Last resort: Argos JA→VI")
                     with self._model_lock:
                         vi_text = argostranslate.translate.translate(text, "ja", "vi")
                     if vi_text and vi_text.strip():
@@ -689,6 +910,59 @@ class TranslationService:
             except Exception as e:
                 logger.error(f"Error processing translation queue: {e}")
 
+    def _split_text_into_chunks(
+        self, text: str, max_tokens: int = 900, overlap: int = 50
+    ) -> List[str]:
+        """Tự động chia văn bản dài thành các chunks nhỏ hơn để tránh vượt quá giới hạn token.
+
+        Args:
+            text: Văn bản cần chia
+            max_tokens: Số token tối đa mỗi chunk (mặc định 900 để an toàn với limit 1024)
+            overlap: Số từ overlap giữa các chunk để giữ context
+
+        Returns:
+            Danh sách các text chunks
+        """
+        if not text or len(text) < 100:
+            return [text]
+
+        # Ước tính token count (1 token ≈ 4 ký tự cho tiếng Anh, 2-3 cho tiếng Việt)
+        estimated_tokens = len(text) // 3
+
+        if estimated_tokens <= max_tokens:
+            return [text]
+
+        # Chia theo câu để giữ ngữ nghĩa
+        sentences = re.split(r"([.!?]\s+)", text)
+
+        chunks = []
+        current_chunk = ""
+        current_tokens = 0
+
+        for i, sentence in enumerate(sentences):
+            sentence_tokens = len(sentence) // 3
+
+            # Nếu thêm câu này vào sẽ vượt quá limit
+            if current_tokens + sentence_tokens > max_tokens and current_chunk:
+                chunks.append(current_chunk.strip())
+
+                # Bắt đầu chunk mới với overlap (lấy vài câu cuối của chunk trước)
+                overlap_text = " ".join(current_chunk.split()[-overlap:])
+                current_chunk = overlap_text + " " + sentence
+                current_tokens = len(current_chunk) // 3
+            else:
+                current_chunk += sentence
+                current_tokens += sentence_tokens
+
+        # Thêm chunk cuối
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+
+        logger.debug(
+            f"Split text into {len(chunks)} chunks (estimated {estimated_tokens} tokens)"
+        )
+        return chunks if chunks else [text]
+
     def _clean_text(self, text: str) -> str:
         """
         Clean and normalize text for translation.
@@ -724,6 +998,113 @@ class TranslationService:
 
         return text.strip()
 
+    def detect_repetition(self, text: str, threshold: float = 0.8) -> Tuple[bool, str]:
+        """Detect and remove repetitive patterns (Whisper hallucination)."""
+        if not text or len(text) < 20:
+            return False, text
+
+        words = text.split()
+        if len(words) < 4:
+            return False, text
+
+        seen_phrases = {}
+        phrase_length = min(5, len(words) // 2)
+
+        for i in range(len(words) - phrase_length + 1):
+            phrase = " ".join(words[i : i + phrase_length])
+            if phrase in seen_phrases:
+                seen_phrases[phrase] += 1
+            else:
+                seen_phrases[phrase] = 1
+
+        max_repetitions = max(seen_phrases.values()) if seen_phrases else 1
+        total_possible = len(words) - phrase_length + 1
+
+        if max_repetitions > 2 and max_repetitions / total_possible > 0.5:
+            repeated_phrase = max(seen_phrases, key=seen_phrases.get)
+            logger.warning(
+                f"Detected repetition pattern: '{repeated_phrase}' x{max_repetitions}"
+            )
+
+            cleaned_words = []
+            phrase_count = 0
+            i = 0
+            while i < len(words):
+                current_phrase = " ".join(words[i : i + phrase_length])
+                if current_phrase == repeated_phrase:
+                    if phrase_count < 1:
+                        cleaned_words.extend(words[i : i + phrase_length])
+                    phrase_count += 1
+                    i += phrase_length
+                else:
+                    cleaned_words.append(words[i])
+                    i += 1
+
+            cleaned_text = " ".join(cleaned_words)
+            return True, cleaned_text
+
+        return False, text
+
+    def detect_segment_repetition(
+        self, segments: List[dict], similarity_threshold: float = 0.85
+    ) -> List[dict]:
+        """Filter consecutive duplicate segments (Whisper hallucination)."""
+        if not segments or len(segments) < 2:
+            return segments
+
+        cleaned_segments = []
+        prev_text = ""
+        repetition_count = 0
+        max_allowed_repetitions = 2
+
+        for segment in segments:
+            current_text = segment.get("text", "").strip()
+
+            if not current_text:
+                continue
+
+            similarity = self._calculate_text_similarity(prev_text, current_text)
+
+            if similarity >= similarity_threshold:
+                repetition_count += 1
+                if repetition_count <= max_allowed_repetitions:
+                    cleaned_segments.append(segment)
+                else:
+                    logger.debug(
+                        f"Skipping repeated segment #{len(cleaned_segments)+1}: "
+                        f"'{current_text[:50]}...' (similarity: {similarity:.2f})"
+                    )
+            else:
+                repetition_count = 0
+                cleaned_segments.append(segment)
+
+            prev_text = current_text
+
+        removed_count = len(segments) - len(cleaned_segments)
+        if removed_count > 0:
+            logger.info(
+                f"🔄 Removed {removed_count} repetitive segments "
+                f"({len(cleaned_segments)}/{len(segments)} remaining)"
+            )
+
+        return cleaned_segments
+
+    def _calculate_text_similarity(self, text1: str, text2: str) -> float:
+        """Calculate Jaccard similarity between two texts (0.0 - 1.0)."""
+        if not text1 or not text2:
+            return 0.0
+
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+
+        if not words1 or not words2:
+            return 0.0
+
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+
+        return intersection / union if union > 0 else 0.0
+
     def _is_target_language(self, text: str) -> bool:
         """
         Check if text is likely already in the target language.
@@ -744,16 +1125,6 @@ class TranslationService:
             # If text contains Vietnamese characters, likely Vietnamese
             if text_chars & vietnamese_chars:
                 return True
-
-        # Try to detect language with short text analysis
-        try:
-            if len(text) > 20:  # Only for longer texts
-                translator = self.translators.get("google_main")
-                if translator:
-                    detection = translator.detect(text)
-                    return detection.lang == self.target_language
-        except:
-            pass
 
         return False
 
@@ -784,53 +1155,12 @@ class TranslationService:
             "ms": "Malay",
         }
 
-    def detect_language(self, text: str) -> Optional[Tuple[str, float]]:
-        """
-        Detect the language of the input text using free methods.
-
-        Args:
-            text: Text to analyze
-
-        Returns:
-            Tuple of (language_code, confidence) or None
-        """
-        try:
-            # Simple heuristic language detection (free, offline)
-            if self._contains_vietnamese_chars(text):
-                return ("vi", 0.8)
-            if self._contains_english_patterns(text):
-                return ("en", 0.7)
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}")
-
-        # Default fallback: assume English with low confidence
-        return ("en", 0.5)
-
     def _contains_vietnamese_chars(self, text: str) -> bool:
         """Check if text contains Vietnamese characters."""
         vietnamese_chars = set(
             "àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ"
         )
         return bool(set(text.lower()) & vietnamese_chars)
-
-    def _contains_english_patterns(self, text: str) -> bool:
-        """Check if text contains common English patterns."""
-        english_words = {
-            "the",
-            "and",
-            "or",
-            "but",
-            "in",
-            "on",
-            "at",
-            "to",
-            "for",
-            "of",
-            "with",
-            "by",
-        }
-        words = text.lower().split()
-        return any(word in english_words for word in words)
 
     def set_callback(self, callback: callable) -> None:
         """
@@ -867,68 +1197,3 @@ class TranslationService:
         self.stop_async_processing()
         self.clear_cache()
         logger.info("TranslationService cleanup completed")
-
-
-def test_translation_service():
-    """Test function for the TranslationService class."""
-    import yaml
-
-    # Test configuration
-    config = {
-        "translation": {
-            "target_language": "vi",
-            "service": "google",
-            "google": {"timeout": 10, "retry_attempts": 3},
-        },
-        "performance": {"max_cache_size": 50},
-    }
-
-    # Test texts
-    test_texts = [
-        "Hello, this is a test of the real-time translation system.",
-        "How are you doing today?",
-        "This is a longer sentence that should be translated into Vietnamese automatically.",
-        "Thank you for using this application.",
-        "Goodbye and have a nice day!",
-    ]
-
-    # Create translation service
-    translator = TranslationService(config)
-
-    def on_translation_done(result):
-        print(f"Async translation completed: {result.translated_text}")
-
-    translator.set_callback(on_translation_done)
-    translator.start_async_processing()
-
-    try:
-        print("Testing synchronous translation:")
-        for text in test_texts:
-            result = translator.translate_text(text)
-            if result:
-                print(f"Original: {result.original_text}")
-                print(f"Vietnamese: {result.translated_text}")
-                print(f"Service: {result.service_used}")
-                print("-" * 50)
-            else:
-                print(f"Failed to translate: {text}")
-
-        print("\nTesting asynchronous translation:")
-        for text in test_texts:
-            translator.translate_async(text)
-
-        # Wait for async translations
-        time.sleep(5)
-
-        # Print cache stats
-        stats = translator.get_cache_stats()
-        print(f"\nCache Stats: {stats}")
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        translator.cleanup()
-
-
-if __name__ == "__main__":
-    test_translation_service()
