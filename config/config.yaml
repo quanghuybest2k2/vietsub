@@ -1,0 +1,48 @@
+# Offline Vietnamese Subtitle Configuration (100% Local)
+
+# Whisper Model Settings
+whisper:
+  model_size: "base" # Options: tiny, base, small, medium, large
+  language: "auto" # Auto-detect or specify (en, es, fr, de, etc.)
+  device: "auto" # auto, cpu, cuda
+
+  # Processing options
+  temperature: 0.0 # Controls randomness (0.0 = deterministic)
+  best_of: 5 # Number of candidates to consider
+  beam_size: 5 # Beam search size
+
+# Translation Settings (FREE & OPEN SOURCE ONLY)
+translation:
+  target_language: "vi" # Vietnamese
+  service: "free" # Uses only free and open-source services
+
+  # Offline processing settings (no internet required)
+  retry_attempts: 1 # Number of retry attempts for local models
+
+  # Service priority (100% OFFLINE):
+  # 1. Local neural models (offline, fastest)
+  # 2. Argos Translate (offline)
+
+# Performance Settings
+performance:
+  # Threading
+  max_workers: 20 # Number of worker threads
+  translation_workers: 4 # Number of parallel workers for subtitle translation (video)
+  processing_queue_size: 10
+
+  # Memory management
+  max_cache_size: 200 # Maximum cached translations
+  cleanup_interval: 60 # Seconds between memory cleanup
+
+# Logging
+logging:
+  level: "INFO" # DEBUG, INFO, WARNING, ERROR
+  file_output: true # Save logs to file
+  console_output: true # Display logs in console
+  max_file_size: "10MB" # Maximum log file size
+  backup_count: 3 # Number of backup log files
+
+# Development/Debug Settings
+debug:
+  show_processing_time: true # Display processing benchmarks
+  verbose_translation: false # Show translation details

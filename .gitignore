@@ -1,0 +1,12 @@
+__pycache__/
+.env
+.vscode
+videos/*
+!videos/english.mp4
+!videos/japanese.mp4
+srt/
+venv/
+*.log
+build/
+dist/
+config/user_preferences.json
