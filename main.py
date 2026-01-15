@@ -67,9 +67,9 @@ class VietnameseSubtitleGenerator:
         self.is_running = False
         self.is_paused = False
 
-        # TTS voice setting (default: female Vietnamese voice)
-        self.tts_voice = "vi-VN-HoaiMyNeural"  # Female voice (default)
-        # Available voices: vi-VN-HoaiMyNeural (female), vi-VN-NamMinhNeural (male)
+        # TTS voice setting (default: female Vietnamese voice using VieNeu)
+        self.tts_voice = "Doan"  # Female voice (default)
+        # Available VieNeu voices: Binh, Tuyen, Vinh (male), Doan, Ly, Ngoc (female)
 
         # Statistics
         self.stats = {
@@ -798,7 +798,7 @@ class VietnameseSubtitleGenerator:
 
         This method:
         1. Parses SRT file to get text and timings
-        2. Generates Vietnamese TTS audio for each segment using edge-tts
+        2. Generates Vietnamese TTS audio for each segment using VieNeu
         3. Mutes original video audio
         4. Merges TTS audio with muted video
         5. Burns subtitles into video
@@ -812,15 +812,14 @@ class VietnameseSubtitleGenerator:
             True if successful, False otherwise
         """
         try:
-            import edge_tts
-            import asyncio
+            from vieneu import Vieneu
             from pydub import AudioSegment
             import tempfile
             import shutil
 
             logger.info(f"Creating voiceover video from: {input_file}")
             logger.info(f"Using SRT file: {srt_file}")
-            logger.info(f"Using TTS voice: {self.tts_voice}")
+            logger.info(f"Using VieNeu TTS voice: {self.tts_voice}")
 
             # Parse SRT file
             segments = self._parse_srt_file(srt_file)
@@ -852,65 +851,30 @@ class VietnameseSubtitleGenerator:
                 logger.info("Creating base audio track...")
                 base_audio = AudioSegment.silent(duration=int(video_duration))
 
-                # Define async function to generate TTS using edge-tts
-                async def generate_segment(
-                    index: int,
-                    text: str,
-                    output_dir: str,
-                    voice: str,
-                    semaphore: asyncio.Semaphore,
-                ) -> bool:
-                    """Generate TTS audio for a single segment with semaphore limit"""
-                    async with semaphore:
-                        try:
-                            output_path = os.path.join(output_dir, f"tts_{index}.mp3")
-                            # Use -15% rate natively for standard "reading" speed without robotic artifacts
-                            communicate = edge_tts.Communicate(text, voice, rate="-15%")
-                            await communicate.save(output_path)
-                            return True
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to generate TTS for segment {index}: {e}"
-                            )
-                            return False
+                # Initialize VieNeu TTS
+                logger.info("Initializing VieNeu TTS engine...")
+                tts = Vieneu()
+                voice_data = tts.get_preset_voice(self.tts_voice)
 
-                async def process_batch_tts(segments, output_dir, voice):
-                    """Process all segments in parallel with rate limiting"""
-                    # Limit to 5 concurrent connections to avoid issues
-                    semaphore = asyncio.Semaphore(5)
-                    tasks = []
+                # Generate TTS for each segment using VieNeu
+                logger.info("Generating TTS audio segments...")
+                for i, segment in enumerate(
+                    tqdm(segments, desc="Generating TTS Audio")
+                ):
+                    text = segment["text"].strip()
+                    if not text:
+                        continue
+                    try:
+                        output_path = os.path.join(temp_dir, f"tts_{i}.wav")
+                        audio_spec = tts.infer(text=text, voice=voice_data)
+                        tts.save(audio_spec, output_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to generate TTS for segment {i}: {e}")
+                        continue
 
-                    for i, segment in enumerate(segments):
-                        text = segment["text"].strip()
-                        if text:
-                            tasks.append(
-                                generate_segment(i, text, output_dir, voice, semaphore)
-                            )
-
-                    if tasks:
-                        # Use tqdm for generation progress
-                        results = []
-                        for f in tqdm(
-                            asyncio.as_completed(tasks),
-                            total=len(tasks),
-                            desc="Downloading TTS Audio",
-                        ):
-                            results.append(await f)
-                        return results
-                    return []
-
-                # Run parallel generation
-                logger.info("Starting parallel TTS generation...")
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(
-                        process_batch_tts(segments, temp_dir, self.tts_voice)
-                    )
-                    loop.close()
-                except Exception as e:
-                    logger.error(f"Async generation failed: {e}")
-                    return False
+                # Cleanup VieNeu TTS
+                tts.close()
+                logger.info("VieNeu TTS generation completed")
 
                 # Sequential Mixing Phase
                 logger.info("Mixing audio segments...")
@@ -923,7 +887,7 @@ class VietnameseSubtitleGenerator:
                         continue
 
                     try:
-                        tts_path = os.path.join(temp_dir, f"tts_{i}.mp3")
+                        tts_path = os.path.join(temp_dir, f"tts_{i}.wav")
 
                         if not os.path.exists(tts_path):
                             logger.warning(
@@ -931,8 +895,8 @@ class VietnameseSubtitleGenerator:
                             )
                             continue
 
-                        # Load TTS audio
-                        tts_audio = AudioSegment.from_mp3(tts_path)
+                        # Load TTS audio (VieNeu outputs WAV format)
+                        tts_audio = AudioSegment.from_wav(tts_path)
 
                         # Add small silence padding for smoother transitions (50ms each side)
                         silence = AudioSegment.silent(duration=50)
@@ -943,7 +907,6 @@ class VietnameseSubtitleGenerator:
                         current_duration = len(tts_audio)
 
                         # Determine tempo change
-                        # Since we already generated at -15% speed (approx 0.85x), defaults to 1.0
                         # Only speed up if the generated audio is too long for the slot
                         final_speed = 1.0
 
@@ -957,7 +920,7 @@ class VietnameseSubtitleGenerator:
                         if abs(final_speed - 1.0) > 0.01:
                             # Use ffmpeg to change tempo
                             processed_path = os.path.join(
-                                temp_dir, f"tts_{i}_processed.mp3"
+                                temp_dir, f"tts_{i}_processed.wav"
                             )
                             speed_cmd = [
                                 "ffmpeg",
@@ -970,7 +933,7 @@ class VietnameseSubtitleGenerator:
                             ]
                             subprocess.run(speed_cmd, capture_output=True)
                             if os.path.exists(processed_path):
-                                tts_audio = AudioSegment.from_mp3(processed_path)
+                                tts_audio = AudioSegment.from_wav(processed_path)
 
                         # If fast-forwarded audio is still slightly longer (due to ffmpeg precision), trim it
                         if len(tts_audio) > available_duration:
@@ -1032,7 +995,9 @@ class VietnameseSubtitleGenerator:
 
         except ImportError as e:
             logger.error(f"Missing required library: {e}")
-            logger.error("Please install: pip install edge-tts pydub")
+            logger.error(
+                "Please install: pip install vieneu pydub --extra-index-url https://pnnbao97.github.io/llama-cpp-python-v0.3.16/cpu/"
+            )
             return False
         except Exception as e:
             logger.error(f"Error creating voiceover video: {e}")
@@ -1177,9 +1142,9 @@ def main():
     parser.add_argument(
         "--voice",
         dest="voice",
-        choices=["female", "male"],
-        default="female",
-        help="TTS voice gender: female (vi-VN-HoaiMyNeural) or male (vi-VN-NamMinhNeural). Default: female",
+        choices=["Binh", "Tuyen", "Vinh", "Doan", "Ly", "Ngoc"],
+        default="Doan",
+        help="VieNeu TTS voice: Binh/Tuyen (male North), Vinh (male South), Doan (female South), Ly/Ngoc (female North). Default: Doan",
     )
 
     args = parser.parse_args()
@@ -1299,13 +1264,9 @@ def main():
                 app.forced_model_size = args.model
                 logger.info(f"Using model size: {args.model}")
 
-            # Set TTS voice based on --voice argument
-            if args.voice == "male":
-                app.tts_voice = "vi-VN-NamMinhNeural"
-                logger.info("Using male voice: vi-VN-NamMinhNeural")
-            else:
-                app.tts_voice = "vi-VN-HoaiMyNeural"
-                logger.info("Using female voice: vi-VN-HoaiMyNeural")
+            # Set TTS voice based on --voice argument (VieNeu voices)
+            app.tts_voice = args.voice
+            logger.info(f"Using VieNeu voice: {args.voice}")
 
             # Check if SRT file is provided or needs to be generated
             srt_file = args.srt_file

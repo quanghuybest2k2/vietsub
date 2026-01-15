@@ -76,7 +76,11 @@
     "voiceover_merging": "Merging audio with video...",
     "select_voiceover_warning": "Please select a video file before creating voiceover.",
     "tts_voice": "🎤 Voice",
-    "voice_female": "Female (HoaiMy)",
-    "voice_male": "Male (NamMinh)",
-    "voice_tooltip": "Select Vietnamese TTS voice for voiceover"
+    "voice_doan": "Đoan (Female - South)",
+    "voice_ly": "Ly (Female - North)",
+    "voice_ngoc": "Ngọc (Female - North)",
+    "voice_binh": "Bình (Male - North)",
+    "voice_tuyen": "Tuyên (Male - North)",
+    "voice_vinh": "Vĩnh (Male - South)",
+    "voice_tooltip": "Select Vietnamese TTS voice for voiceover (VieNeu)"
 }

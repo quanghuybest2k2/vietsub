@@ -1114,15 +1114,19 @@ class AppTk(QMainWindow):
         """
         )
 
-        # Voice combobox
+        # Voice combobox (VieNeu voices)
         self.voice_combo = QComboBox()
         self.voice_combo.addItems(
             [
-                self.t("voice_female"),
-                self.t("voice_male"),
+                self.t("voice_doan"),
+                self.t("voice_ly"),
+                self.t("voice_ngoc"),
+                self.t("voice_binh"),
+                self.t("voice_tuyen"),
+                self.t("voice_vinh"),
             ]
         )
-        self.voice_combo.setCurrentIndex(0)  # Default to female voice
+        self.voice_combo.setCurrentIndex(0)  # Default to Doan (female South)
         self.voice_combo.setFont(QFont("Segoe UI", 9))
         self.voice_combo.setFixedHeight(36)
         self.voice_combo.setMinimumWidth(100)
@@ -2054,13 +2058,17 @@ class AppTk(QMainWindow):
         )
         self.model_combo.setCurrentIndex(current_model_index)
 
-        # Update voice combobox items
+        # Update voice combobox items (VieNeu voices)
         current_voice_index = self.voice_combo.currentIndex()
         self.voice_combo.clear()
         self.voice_combo.addItems(
             [
-                self.t("voice_female"),
-                self.t("voice_male"),
+                self.t("voice_doan"),
+                self.t("voice_ly"),
+                self.t("voice_ngoc"),
+                self.t("voice_binh"),
+                self.t("voice_tuyen"),
+                self.t("voice_vinh"),
             ]
         )
         self.voice_combo.setCurrentIndex(current_voice_index)
@@ -2266,9 +2274,12 @@ class AppTk(QMainWindow):
             model_list[model_index] if 0 <= model_index < len(model_list) else "base"
         )
 
-        # Read selected voice from UI
+        # Read selected voice from UI (VieNeu voices)
         voice_index = self.voice_combo.currentIndex()
-        selected_voice = "female" if voice_index == 0 else "male"
+        voice_list = ["Doan", "Ly", "Ngoc", "Binh", "Tuyen", "Vinh"]
+        selected_voice = (
+            voice_list[voice_index] if 0 <= voice_index < len(voice_list) else "Doan"
+        )
 
         # Reset pause state
         self.pause_event.set()

@@ -76,7 +76,11 @@
     "voiceover_merging": "Đang ghép audio với video...",
     "select_voiceover_warning": "Vui lòng chọn tệp video trước khi tạo video thuyết minh.",
     "tts_voice": "🎤 Giọng Đọc",
-    "voice_female": "Nữ (HoaiMy)",
-    "voice_male": "Nam (NamMinh)",
-    "voice_tooltip": "Chọn giọng đọc tiếng Việt cho video thuyết minh"
+    "voice_doan": "Đoan (Nữ - Miền Nam)",
+    "voice_ly": "Ly (Nữ - Miền Bắc)",
+    "voice_ngoc": "Ngọc (Nữ - Miền Bắc)",
+    "voice_binh": "Bình (Nam - Miền Bắc)",
+    "voice_tuyen": "Tuyên (Nam - Miền Bắc)",
+    "voice_vinh": "Vĩnh (Nam - Miền Nam)",
+    "voice_tooltip": "Chọn giọng đọc tiếng Việt cho video thuyết minh (VieNeu)"
 }
