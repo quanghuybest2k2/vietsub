@@ -24,6 +24,7 @@
 
 - Python 3.12.6 ([download here](https://www.python.org/downloads/release/python-3126/) - Windows installer (64-bit))
 - FFmpeg ([download here](https://www.gyan.dev/ffmpeg/builds/) - ffmpeg-git-essentials.7z)
+- espeak-ng (Recommend): Text-to-Speech engine ([download here](https://github.com/espeak-ng/espeak-ng/releases)) - espeak-ng.msi (latest version)
 - No internet connection required (after installing dependencies)
 
 ## Installation
