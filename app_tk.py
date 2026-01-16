@@ -1096,8 +1096,8 @@ class AppTk(QMainWindow):
 
         # Voice help button
         self.voice_help_btn = QPushButton("?")
-        self.voice_help_btn.setFixedSize(18, 18)
-        self.voice_help_btn.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        self.voice_help_btn.setFixedSize(16, 16)
+        self.voice_help_btn.setFont(QFont("Segoe UI", 9, QFont.Bold))
         self.voice_help_btn.setCursor(Qt.PointingHandCursor)
         self.voice_help_btn.setToolTip(self.t("voice_tooltip"))
         self.voice_help_btn.setStyleSheet(
@@ -1106,10 +1106,20 @@ class AppTk(QMainWindow):
                 background-color: {self.colors['primary']};
                 color: white;
                 border: none;
-                border-radius: 9px;
+                border-radius: 8px;
+                font-size: 9px;
+                font-weight: bold;
             }}
             QPushButton:hover {{
                 background-color: {self.colors['primary_hover']};
+            }}
+            QToolTip {{
+                background-color: {self.colors['card_bg']};
+                color: {self.colors['text_dark']};
+                border: 1px solid {self.colors['border']};
+                padding: 5px;
+                border-radius: 3px;
+                font-size: 10px;
             }}
         """
         )
@@ -1777,10 +1787,20 @@ class AppTk(QMainWindow):
                 background-color: {self.colors['primary']};
                 color: white;
                 border: none;
-                border-radius: 9px;
+                border-radius: 8px;
+                font-size: 9px;
+                font-weight: bold;
             }}
             QPushButton:hover {{
                 background-color: {self.colors['primary_hover']};
+            }}
+            QToolTip {{
+                background-color: {self.colors['card_bg']};
+                color: {self.colors['text_dark']};
+                border: 1px solid {self.colors['border']};
+                padding: 5px;
+                border-radius: 3px;
+                font-size: 10px;
             }}
         """
         )
