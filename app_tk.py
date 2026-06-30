@@ -2620,9 +2620,16 @@ class AppTk(QMainWindow):
             while True:
                 msg = self.msg_queue.get_nowait()
                 if msg.startswith("__DONE__:"):
-                    parts = msg.split(":", 2)
-                    ok = parts[1] == "True"
-                    out = parts[2] if len(parts) > 2 else ""
+                    # Format: __DONE__:<True|False>:[optional_path]
+                    # Cannot use split(":", 2) because paths contain colons on Windows (e.g. C:\...)
+                    suffix = msg[len("__DONE__:"):]
+                    colon_pos = suffix.find(":")
+                    if colon_pos != -1:
+                        ok = suffix[:colon_pos] == "True"
+                        out = suffix[colon_pos + 1:]
+                    else:
+                        ok = suffix == "True"
+                        out = ""
                     if ok:
                         self.log.append("\n" + "=" * 80)
                         self.log.append(self.t("completed"))

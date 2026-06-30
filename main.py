@@ -309,7 +309,7 @@ class VietnameseSubtitleGenerator:
         try:
             # Transcribe audio using Whisper
             start_time = time.time()
-            result = self.whisper_model.transcribe(
+            segments, info = self.whisper_model.transcribe(
                 audio_file_path,
                 language=self.config["whisper"].get("language", "auto"),
                 temperature=self.config["whisper"].get("temperature", 0.0),
@@ -320,9 +320,9 @@ class VietnameseSubtitleGenerator:
 
             transcription_time = time.time() - start_time
 
-            # Extract text
-            text = result["text"].strip()
-            detected_language = result.get("language", "unknown")
+            # Extract text from segments
+            text = "".join(segment.text for segment in segments).strip()
+            detected_language = info.language
 
             if text:
                 logger.info(f"Transcribed ({detected_language}): {text}")

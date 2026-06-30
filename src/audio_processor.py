@@ -48,6 +48,9 @@ class AudioProcessor:
         self.audio_queue = queue.Queue(maxsize=100)
         self.processing_thread = None
         self.is_recording = False
+
+        # Track temp files for deferred cleanup (prevents race conditions)
+        self._temp_files = []
         self.is_paused = False
 
         # Audio buffer for chunk assembly
@@ -288,16 +291,13 @@ class AudioProcessor:
 
         # Trigger callback with audio file path
         if self.on_audio_chunk and temp_file:
+            self._temp_files.append(temp_file)
             try:
                 self.on_audio_chunk(temp_file)
             except Exception as e:
                 logger.error(f"Error in audio chunk callback: {e}")
-            finally:
-                # Cleanup temporary file
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
+        # Note: temp file cleanup is deferred to cleanup() to prevent race
+        # conditions if the callback processes the file asynchronously.
 
         # Clear buffer
         self.audio_buffer.clear()
@@ -367,12 +367,20 @@ class AudioProcessor:
         self.on_silence_detected = on_silence_detected
 
     def cleanup(self):
-        """Cleanup PyAudio resources."""
+        """Cleanup PyAudio resources and temporary files."""
         self.stop_recording()
 
         if hasattr(self, "pyaudio_instance") and self.pyaudio_instance:
             self.pyaudio_instance.terminate()
             self.pyaudio_instance = None
+
+        # Cleanup any remaining temp files
+        for f in self._temp_files:
+            try:
+                os.unlink(f)
+            except Exception:
+                pass
+        self._temp_files.clear()
 
         logger.info("AudioProcessor cleanup completed")
 
