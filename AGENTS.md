@@ -106,15 +106,22 @@ Prevents Whisper hallucination in long videos:
 
 ```
 vietsub/
-├── main.py              # CLI + orchestrator (~1290 lines)
-├── app_tk.py            # PySide6 GUI (~2900 lines)
-├── config/config.yaml   # Central configuration
-├── lang/en.json, vi.json # UI localization strings
+├── main.py              # CLI + orchestrator
+├── app_tk.py            # PySide6 GUI
+├── AGENTS.md            # Agent instructions (this file)
+├── run.sh               # Convenience launcher script
+├── config/
+│   ├── config.yaml      # Central configuration
+│   └── user_preferences.json  # User language/theme prefs
+├── images/              # Screenshots & demo images
+├── lang/                # UI localization (en.json, vi.json)
 ├── src/
 │   ├── audio_processor.py  # Real-time mic capture
 │   ├── translator.py       # Translation engine + cache
 │   └── subtitle_overlay.py # OpenCV overlay rendering
-└── srt/                # Generated subtitle output directory
+├── srt/                 # Generated subtitle output directory
+├── videos/              # Sample videos directory
+└── logs/                # Application logs
 ```
 
 ## Important Pitfalls

@@ -1,10 +1,10 @@
 # Offline Vietnamese Subtitle Generator
 
-100% offline video subtitle generation system powered by OpenAI Whisper and local translation models. No internet connection required after initial setup.
+100% offline video subtitle generation system powered by faster-whisper and local translation models. No internet connection required after initial setup.
 
 ## Features
 
-- **Offline Speech Recognition**: OpenAI Whisper-based accurate transcription (100% local)
+- **Offline Speech Recognition**: faster-whisper-based accurate transcription (100% local)
 - **Advanced Translation**: NLLB-200-distilled-600M for high-quality translation (max 1024 tokens)
 - **Auto Chunk Processing**: Automatically splits long texts to handle videos >3 hours
 - **Smart Fallback**: Multi-layer fallback (NLLB → opus-mt → Argos) ensures reliability
@@ -12,7 +12,7 @@
 - **Voice-Over Generation**: Create videos with natural Vietnamese voice-over (TTS) from subtitles
 - **Subtitle Export**: Export standalone .srt subtitle files without creating video
 - **Multi-language Support**: EN, JA, ZH, KO, TH, ID → VI (direct translation)
-- **Modern GUI**: Easy-to-use PyQt6 interface with progress tracking and pause/resume
+- **Modern GUI**: Easy-to-use PySide6 interface with progress tracking and pause/resume
 - **100% Free & Open Source**: No API keys, subscriptions, or rate limits
 - **Complete Privacy**: All processing done locally on your machine
 
@@ -24,7 +24,7 @@
 
 - Python 3.12.6 ([download here](https://www.python.org/downloads/release/python-3126/) - Windows installer (64-bit))
 - FFmpeg ([download here](https://www.gyan.dev/ffmpeg/builds/) - ffmpeg-git-essentials.7z)
-- espeak-ng (Recommend): Text-to-Speech engine ([download here](https://github.com/espeak-ng/espeak-ng/releases)) - espeak-ng.msi (latest version)
+- espeak-ng (optional): Text-to-Speech engine for TTS backup ([download here](https://github.com/espeak-ng/espeak-ng/releases))
 - No internet connection required (after installing dependencies)
 
 ## Installation
@@ -58,7 +58,7 @@
 
 ### GUI Mode (Recommended)
 
-Launch the modern PyQt6 interface with drag-and-drop support:
+Launch the modern PySide6 interface with drag-and-drop support:
 
 ```bash
 python app_tk.py
@@ -179,11 +179,12 @@ Note: All processing is done 100% offline. Internet is not required after depend
 Edit `config/config.yaml` to customize:
 
 - **Whisper model size**: tiny, base, small, medium, large (affects accuracy vs speed)
-- **Translation workers**: Number of parallel threads (default: 4, optimal for most CPUs)
-  - 4 workers: Best for 4-8 core CPUs (recommended)
-  - 6-8 workers: For 8+ core CPUs with 16GB+ RAM
+- **Translation workers**: Number of parallel threads for video mode (default: 6, optimal for most CPUs)
+  - 6 workers: Best for 4-8 core CPUs (recommended)
+  - 8 workers (`export_translation_workers`): For SRT export mode with higher throughput
   - Batch processing automatically optimizes throughput
-- **Cache size**: Translation cache size (default: 200, increased for batch processing)
+- **Cache size**: Translation cache (default: 1000 entries, LRU eviction)
+- **Batch size**: `translation_batch_size: 32` (video mode), `export_translation_batch_size: 64` (export mode)
 - **Subtitle appearance**: Font, size, color, position, background opacity
 - **Video output**: Codec, bitrate, FPS settings
 - All settings optimized for offline processing with batch translation
@@ -192,32 +193,50 @@ Edit `config/config.yaml` to customize:
 
 ```
 vietsub/
-├── app_tk.py                # Modern PyQt6 GUI interface
-├── main.py                  # Command-line entry point
-├── config/config.yaml       # Configuration file (offline settings)
+├── app_tk.py                # PySide6 GUI interface
+├── main.py                  # CLI entry point & orchestrator
+├── AGENTS.md                # Agent instructions for AI assistants
+├── run.sh                   # Convenience launcher script
 ├── requirements.txt         # Dependencies
+├── LICENSE                  # MIT License
+├── .gitignore
+├── .gitattributes
+├── .github/
+│   └── prompts/             # Chat commands (/ai-commit, /code-review)
+│       ├── ai-commit.prompt.md
+│       └── code-review.prompt.md
+├── config/
+│   ├── config.yaml          # Central configuration
+│   └── user_preferences.json# User language/theme preferences
+├── images/
+│   └── demo.png             # Screenshot
+├── lang/
+│   ├── en.json              # English UI localization
+│   └── vi.json              # Vietnamese UI localization
 ├── src/
-│   ├── audio_processor.py   # Audio extraction & preprocessing
-│   ├── subtitle_overlay.py  # Subtitle rendering & video processing
-│   └── translator.py        # Offline translation services (100% local)
-├── tests/
-│   └── test_parallel_translation.py
-├── videos/                  # Sample videos directory
+│   ├── audio_processor.py   # Real-time mic capture (PyAudio)
+│   ├── subtitle_overlay.py  # Subtitle rendering (OpenCV)
+│   └── translator.py        # Translation engine + cache (NLLB/opus-mt/Argos)
+├── srt/                     # Generated subtitle output
+├── videos/                  # Sample videos
 └── logs/                    # Application logs
 ```
 
 ## Dependencies
 
-- `openai-whisper` - Speech recognition (offline)
-- `transformers` - Local neural translation models (Helsinki-NLP)
-- `argostranslate` - Offline statistical translation
-- `PyQt6` - Modern GUI framework
-- `opencv-python` - Video processing
+- `faster-whisper` - Speech recognition (offline, CTranslate2 backend)
+- `transformers` - Local neural translation models (NLLB, opus-mt)
+- `argostranslate` - Offline statistical translation (fallback)
+- `PySide6` - Modern GUI framework
+- `opencv-python` - Video processing & subtitle overlay
+- `moviepy` - Video/audio manipulation (FFmpeg wrapper)
 - `torch` - Deep learning framework (CPU/CUDA support)
 - `pyyaml` - Configuration parsing
 - `loguru` - Logging
 - `tqdm` - Progress bars
-- `ffmpeg-python` - Video/audio manipulation
+- `vieneu` - Vietnamese TTS voiceover (VieNeu v3 Turbo)
+- `pydub` - Audio processing
+- `keyboard` - Global hotkey support
 
 ## Troubleshooting
 
@@ -231,8 +250,8 @@ vietsub/
 **Performance issues**:
 
 - Use smaller Whisper model (`tiny` or `base`) in `config/config.yaml` for faster processing
-- Adjust `translation_workers` (default: 4) based on your CPU cores
-- Recommended: 4 workers for 4-8 cores, 6-8 workers for 8+ cores
+- Adjust `translation_workers` (default: 6) based on your CPU cores
+- Recommended: 6 workers for 4-8 cores, 8 workers (`export_translation_workers`) for 8+ cores
 
 **Processing paused/stuck**:
 
@@ -247,11 +266,11 @@ vietsub/
 ## Performance Tips
 
 - **NLLB Model**: Uses facebook/nllb-200-distilled-600M for high-quality translation with 1024 token support
-- **Batch Translation**: Optimized batch processing with size 8 for stable long-video handling
+- **Batch Translation**: Optimized batch processing with configurable size (32 for video mode, 64 for export mode)
 - **Auto Chunking**: Automatically splits long texts (>1024 tokens) for videos >3 hours
-- **Smart Caching**: Automatic caching of translations reduces redundant processing
+- **Smart Caching**: Automatic LRU caching of translations (1000 entries) reduces redundant processing
 - **Parallel Processing**: Multi-threaded translation with optimized lock scope for maximum throughput
-- **CPU Usage**: Translation workers utilize multiple CPU cores efficiently (default: 4 workers)
+- **CPU Usage**: Translation workers utilize multiple CPU cores efficiently (default: 6 workers, 8 for export)
 - **Memory**: Models require ~2-4GB RAM (NLLB: ~1.2GB, Whisper varies by size)
 - **First Run**: Allow 5-10 minutes for automatic model downloads (one-time setup)
 - **Subsequent Runs**: Fully offline with no internet dependency
