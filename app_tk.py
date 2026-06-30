@@ -1124,19 +1124,24 @@ class AppTk(QMainWindow):
         """
         )
 
-        # Voice combobox (VieNeu voices)
+        # Voice combobox (VieNeu v3 Turbo voices)
         self.voice_combo = QComboBox()
         self.voice_combo.addItems(
             [
-                self.t("voice_doan"),
-                self.t("voice_ly"),
-                self.t("voice_ngoc"),
-                self.t("voice_binh"),
-                self.t("voice_tuyen"),
-                self.t("voice_vinh"),
+                self.t("voice_ngoc_lan"),
+                self.t("voice_ngoc_linh"),
+                self.t("voice_truc_ly"),
+                self.t("voice_my_duyen"),
+                self.t("voice_xuan_vinh"),
+                self.t("voice_thai_son"),
+                self.t("voice_gia_bao"),
+                self.t("voice_duc_tri"),
+                self.t("voice_trong_huu"),
+                self.t("voice_binh_an"),
             ]
         )
-        self.voice_combo.setCurrentIndex(0)  # Default to Doan (female South)
+        self.voice_combo.setCurrentIndex(0)  # Default: Ngọc Lan
+        self.voice_combo.setMaxVisibleItems(10)
         self.voice_combo.setFont(QFont("Segoe UI", 9))
         self.voice_combo.setFixedHeight(36)
         self.voice_combo.setMinimumWidth(100)
@@ -1253,49 +1258,6 @@ class AppTk(QMainWindow):
         self.start_btn.clicked.connect(self.handle_start_stop_continue)
         btn_layout.addWidget(self.start_btn)
 
-        self.log_btn = QPushButton(self.t("view_logs"))
-        self.log_btn.setFont(QFont("Segoe UI", 10))
-        self.log_btn.setCursor(Qt.PointingHandCursor)
-        self.log_btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                background-color: #FFA726;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 14px 25px;
-            }}
-            QPushButton:hover {{
-                background-color: #FB8C00;
-            }}
-        """
-        )
-        self.log_btn.clicked.connect(self.open_log_file)
-        btn_layout.addWidget(self.log_btn)
-
-        self.reset_btn = QPushButton(self.t("reset"))
-        self.reset_btn.setFont(QFont("Segoe UI", 10))
-        self.reset_btn.setCursor(Qt.PointingHandCursor)
-        reset_bg = "#E0E0E0" if self.current_theme == "light" else "#3A3A3A"
-        reset_hover = "#D0D0D0" if self.current_theme == "light" else "#4A4A4A"
-        reset_text = "#2C3E50" if self.current_theme == "light" else "#E0E0E0"
-        self.reset_btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                background-color: {reset_bg};
-                color: {reset_text};
-                border: none;
-                border-radius: 4px;
-                padding: 14px 20px;
-            }}
-            QPushButton:hover {{
-                background-color: {reset_hover};
-            }}
-        """
-        )
-        self.reset_btn.clicked.connect(self.reset_ui)
-        btn_layout.addWidget(self.reset_btn)
-
         # Export SRT Only button
         self.export_srt_btn = QPushButton(self.t("export_srt"))
         self.export_srt_btn.setFont(QFont("Segoe UI", 10))
@@ -1394,6 +1356,57 @@ class AppTk(QMainWindow):
         self.log.setMinimumHeight(150)
         self.log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         content_layout.addWidget(self.log, stretch=1)
+
+        # Log action buttons row
+        log_btn_layout = QHBoxLayout()
+        log_btn_layout.setSpacing(8)
+
+        self.reset_btn = QPushButton(self.t("reset"))
+        self.reset_btn.setFont(QFont("Segoe UI", 9))
+        self.reset_btn.setCursor(Qt.PointingHandCursor)
+        reset_bg = "#E0E0E0" if self.current_theme == "light" else "#3A3A3A"
+        reset_hover = "#D0D0D0" if self.current_theme == "light" else "#4A4A4A"
+        reset_text = "#2C3E50" if self.current_theme == "light" else "#E0E0E0"
+        self.reset_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {reset_bg};
+                color: {reset_text};
+                border: none;
+                border-radius: 4px;
+                padding: 6px 14px;
+            }}
+            QPushButton:hover {{
+                background-color: {reset_hover};
+            }}
+        """
+        )
+        self.reset_btn.clicked.connect(self.reset_ui)
+        log_btn_layout.addWidget(self.reset_btn)
+
+        log_btn_layout.addStretch()
+
+        self.log_btn = QPushButton(self.t("view_logs"))
+        self.log_btn.setFont(QFont("Segoe UI", 9))
+        self.log_btn.setCursor(Qt.PointingHandCursor)
+        self.log_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: #FFA726;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 14px;
+            }}
+            QPushButton:hover {{
+                background-color: #FB8C00;
+            }}
+        """
+        )
+        self.log_btn.clicked.connect(self.open_log_file)
+        log_btn_layout.addWidget(self.log_btn)
+
+        content_layout.addLayout(log_btn_layout)
 
         # Status bar
         self.status_label = QLabel(self.t("ready"))
@@ -1855,7 +1868,7 @@ class AppTk(QMainWindow):
                 color: white;
                 border: none;
                 border-radius: 4px;
-                padding: 14px 25px;
+                padding: 6px 14px;
             }}
             QPushButton:hover {{
                 background-color: #FB8C00;
@@ -1873,7 +1886,7 @@ class AppTk(QMainWindow):
                 color: {reset_text};
                 border: none;
                 border-radius: 4px;
-                padding: 14px 20px;
+                padding: 6px 14px;
             }}
             QPushButton:hover {{
                 background-color: {reset_hover};
@@ -2083,12 +2096,16 @@ class AppTk(QMainWindow):
         self.voice_combo.clear()
         self.voice_combo.addItems(
             [
-                self.t("voice_doan"),
-                self.t("voice_ly"),
-                self.t("voice_ngoc"),
-                self.t("voice_binh"),
-                self.t("voice_tuyen"),
-                self.t("voice_vinh"),
+                self.t("voice_ngoc_lan"),
+                self.t("voice_ngoc_linh"),
+                self.t("voice_truc_ly"),
+                self.t("voice_my_duyen"),
+                self.t("voice_xuan_vinh"),
+                self.t("voice_thai_son"),
+                self.t("voice_gia_bao"),
+                self.t("voice_duc_tri"),
+                self.t("voice_trong_huu"),
+                self.t("voice_binh_an"),
             ]
         )
         self.voice_combo.setCurrentIndex(current_voice_index)
@@ -2294,12 +2311,10 @@ class AppTk(QMainWindow):
             model_list[model_index] if 0 <= model_index < len(model_list) else "base"
         )
 
-        # Read selected voice from UI (VieNeu voices)
-        voice_index = self.voice_combo.currentIndex()
-        voice_list = ["Doan", "Ly", "Ngoc", "Binh", "Tuyen", "Vinh"]
-        selected_voice = (
-            voice_list[voice_index] if 0 <= voice_index < len(voice_list) else "Doan"
-        )
+        # Read selected voice from UI (VieNeu v3 Turbo voices)
+        # Format: "Ngọc Lan (Nữ - Dịu dàng)" → extract "Ngọc Lan"
+        selected_label = self.voice_combo.currentText()
+        selected_voice = selected_label.split(" (")[0] if " (" in selected_label else "Ngọc Lan"
 
         # Reset pause state
         self.pause_event.set()

@@ -36,6 +36,12 @@ python -m venv venv
 
 > **Agent instruction:** Always check if venv is active before running any Python-related command. If not active, run `source venv/Scripts/activate` first.
 
+## ⚠️ RULE — Sync requirements.txt After Any pip Change
+
+> After every `pip install` or `pip uninstall` inside the venv, **must** update `requirements.txt` immediately.
+> Only list direct dependencies — do NOT dump the entire `pip freeze`.
+> If a package requires a special `--extra-index-url` (torch CUDA, vieneu), include the index URL next to it.
+
 ## Quick Start
 
 ```bash
@@ -61,14 +67,14 @@ app_tk.py (PySide6 GUI) ──spawns subprocess──► main.py (CLI + core log
 
 ## CLI Flags (`main.py`)
 
-| Flag                                        | Purpose                                                |
-| ------------------------------------------- | ------------------------------------------------------ |
-| `--video --input FILE --output FILE`        | Full pipeline: transcribe → translate → burn subtitles |
-| `--export-srt --input FILE`                 | Export .srt subtitle file only                         |
-| `--voiceover --input FILE`                  | Create video with Vietnamese TTS voiceover             |
-| `--language en\|ja\|zh\|ko\|th\|id`         | Source language (default: en)                          |
-| `--model tiny\|base\|small\|medium\|large`  | Whisper model size                                     |
-| `--voice Binh\|Tuyen\|Vinh\|Doan\|Ly\|Ngoc` | VieNeu TTS voice                                       |
+| Flag                                                             | Purpose                                                |
+| ---------------------------------------------------------------- | ------------------------------------------------------ |
+| `--video --input FILE --output FILE`                             | Full pipeline: transcribe → translate → burn subtitles |
+| `--export-srt --input FILE`                                      | Export .srt subtitle file only                         |
+| `--voiceover --input FILE`                                       | Create video with Vietnamese TTS voiceover             |
+| `--language en\|ja\|zh\|ko\|th\|id`                              | Source language (default: en)                          |
+| `--model tiny\|base\|small\|medium\|large`                       | Whisper model size                                     |
+| `--voice Ngọc Lan\|Ngọc Linh\|Trúc Ly\|Mỹ Duyên\|Xuân Vĩnh\|...` | VieNeu v3 Turbo TTS voice (default: Ngọc Lan)          |
 
 ## Translation Pipeline (fallback chain)
 
@@ -100,7 +106,7 @@ Prevents Whisper hallucination in long videos:
 
 ```
 vietsub/
-├── main.py              # CLI + orchestrator (~900 lines)
+├── main.py              # CLI + orchestrator (~1290 lines)
 ├── app_tk.py            # PySide6 GUI (~2900 lines)
 ├── config/config.yaml   # Central configuration
 ├── lang/en.json, vi.json # UI localization strings
@@ -114,7 +120,7 @@ vietsub/
 ## Important Pitfalls
 
 1. **NLLB model** downloads ~600MB on first run — needs disk space and initial internet despite "offline" label.
-2. **VieNeu TTS** depends on a custom third-party PyPI index (`pnnbao97.github.io`). If unavailable, voiceover mode breaks.
+2. **VieNeu TTS v3 Turbo** — auto-downloads model from HuggingFace on first use (~2GB). Needs internet for initial setup. Runs on GPU (PyTorch) or CPU (ONNX) automatically.
 3. **Concurrent temp files:** `temp_audio.wav` and `temp_subtitles.srt` used without process-specific naming.
 4. **ffmpeg** must be in PATH — no graceful error if missing.
 5. **`keyboard` library** needs admin/sudo on Linux for hotkeys.

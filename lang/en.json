@@ -76,11 +76,15 @@
     "voiceover_merging": "Merging audio with video...",
     "select_voiceover_warning": "Please select a video file before creating voiceover.",
     "tts_voice": "🎤 Voice",
-    "voice_doan": "Đoan (Female - South)",
-    "voice_ly": "Ly (Female - North)",
-    "voice_ngoc": "Ngọc (Female - North)",
-    "voice_binh": "Bình (Male - North)",
-    "voice_tuyen": "Tuyên (Male - North)",
-    "voice_vinh": "Vĩnh (Male - South)",
-    "voice_tooltip": "Select Vietnamese TTS voice for voiceover (VieNeu)"
+    "voice_ngoc_lan": "Ngọc Lan (Female - Gentle)",
+    "voice_ngoc_linh": "Ngọc Linh (Female - Bright)",
+    "voice_truc_ly": "Trúc Ly (Female - Youthful)",
+    "voice_my_duyen": "Mỹ Duyên (Female - Smooth)",
+    "voice_xuan_vinh": "Xuân Vĩnh (Male - Cheerful)",
+    "voice_thai_son": "Thái Sơn (Male - Strong)",
+    "voice_gia_bao": "Gia Bảo (Male - Smooth)",
+    "voice_duc_tri": "Đức Trí (Male - Clear)",
+    "voice_trong_huu": "Trọng Hữu (Male - Scholarly)",
+    "voice_binh_an": "Bình An (Male - Calm)",
+    "voice_tooltip": "Select Vietnamese TTS voice for voiceover (VieNeu v3 Turbo)"
 }

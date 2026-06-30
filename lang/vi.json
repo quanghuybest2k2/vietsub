@@ -76,11 +76,15 @@
     "voiceover_merging": "Đang ghép audio với video...",
     "select_voiceover_warning": "Vui lòng chọn tệp video trước khi tạo video thuyết minh.",
     "tts_voice": "🎤 Giọng Đọc",
-    "voice_doan": "Đoan (Nữ - Miền Nam)",
-    "voice_ly": "Ly (Nữ - Miền Bắc)",
-    "voice_ngoc": "Ngọc (Nữ - Miền Bắc)",
-    "voice_binh": "Bình (Nam - Miền Bắc)",
-    "voice_tuyen": "Tuyên (Nam - Miền Bắc)",
-    "voice_vinh": "Vĩnh (Nam - Miền Nam)",
-    "voice_tooltip": "Chọn giọng đọc tiếng Việt cho video thuyết minh (VieNeu)"
+    "voice_ngoc_lan": "Ngọc Lan (Nữ - Dịu dàng)",
+    "voice_ngoc_linh": "Ngọc Linh (Nữ - Tươi sáng)",
+    "voice_truc_ly": "Trúc Ly (Nữ - Trẻ trung)",
+    "voice_my_duyen": "Mỹ Duyên (Nữ - Mượt mà)",
+    "voice_xuan_vinh": "Xuân Vĩnh (Nam - Vui tươi)",
+    "voice_thai_son": "Thái Sơn (Nam - Chắc khỏe)",
+    "voice_gia_bao": "Gia Bảo (Nam - Mượt mà)",
+    "voice_duc_tri": "Đức Trí (Nam - Rõ ràng)",
+    "voice_trong_huu": "Trọng Hữu (Nam - Uyên bác)",
+    "voice_binh_an": "Bình An (Nam - Điềm đạm)",
+    "voice_tooltip": "Chọn giọng đọc tiếng Việt cho video thuyết minh (VieNeu v3 Turbo)"
 }

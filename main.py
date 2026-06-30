@@ -22,10 +22,9 @@ from pathlib import Path
 from typing import Dict, Any
 from tqdm import tqdm
 import yaml
+import re
+import unicodedata
 
-
-# Import faster-whisper (optimized for speed and accuracy)
-from faster_whisper import WhisperModel
 
 from loguru import logger
 import keyboard
@@ -67,9 +66,11 @@ class VietnameseSubtitleGenerator:
         self.is_running = False
         self.is_paused = False
 
-        # TTS voice setting (default: female Vietnamese voice using VieNeu)
-        self.tts_voice = "Doan"  # Female voice (default)
-        # Available VieNeu voices: Binh, Tuyen, Vinh (male), Doan, Ly, Ngoc (female)
+        # TTS voice setting (default: female Vietnamese voice using VieNeu v3 Turbo)
+        self.tts_voice = "Ngọc Lan"  # Female, soft/gentle (default v3 voice)
+        # Available VieNeu v3 Turbo voices:
+        # Female: Ngọc Lan (default), Ngọc Linh, Trúc Ly, Mỹ Duyên
+        # Male: Xuân Vĩnh, Thái Sơn, Gia Bảo, Đức Trí, Trọng Hữu, Bình An
 
         # Statistics
         self.stats = {
@@ -168,8 +169,23 @@ class VietnameseSubtitleGenerator:
                 except Exception:
                     device = "cpu"
             self.device = device
+
+            # Pre-load torch cuDNN before ctranslate2 to avoid DLL conflict on Windows
+            if self.device == "cuda":
+                try:
+                    import torch
+                    _ = torch.zeros(1, device="cuda")
+                    _ = torch.nn.functional.relu(torch.tensor(0.0, device="cuda"))
+                except Exception as e:
+                    logger.warning(f"Could not pre-load cuDNN (non-fatal): {e}")
+
+            # Lazily import after cuDNN pre-load (top-level would load ctranslate2 first)
+            from faster_whisper import WhisperModel
+
+            # Use float16 on GPU for faster inference, float32 on CPU
+            compute_type = "float16" if device == "cuda" else "float32"
             self.whisper_model = WhisperModel(
-                model_size, device=device, compute_type="float32"
+                model_size, device=device, compute_type=compute_type
             )
             logger.info(f"faster-whisper model '{model_size}' loaded on {device}")
 
@@ -851,10 +867,9 @@ class VietnameseSubtitleGenerator:
                 logger.info("Creating base audio track...")
                 base_audio = AudioSegment.silent(duration=int(video_duration))
 
-                # Initialize VieNeu TTS
-                logger.info("Initializing VieNeu TTS engine...")
-                tts = Vieneu()
-                voice_data = tts.get_preset_voice(self.tts_voice)
+                # Initialize VieNeu TTS (v3 Turbo)
+                logger.info("Initializing VieNeu TTS v3 Turbo engine...")
+                tts = Vieneu()  # Auto-detects GPU/CPU, defaults to v3 Turbo
 
                 # Generate TTS for each segment using VieNeu
                 logger.info("Generating TTS audio segments...")
@@ -866,8 +881,8 @@ class VietnameseSubtitleGenerator:
                         continue
                     try:
                         output_path = os.path.join(temp_dir, f"tts_{i}.wav")
-                        audio_spec = tts.infer(text=text, voice=voice_data)
-                        tts.save(audio_spec, output_path)
+                        audio = tts.infer(text, voice=self.tts_voice)
+                        tts.save(audio, output_path)
                     except Exception as e:
                         logger.warning(f"Failed to generate TTS for segment {i}: {e}")
                         continue
@@ -906,17 +921,18 @@ class VietnameseSubtitleGenerator:
                         available_duration = end_ms - start_ms
                         current_duration = len(tts_audio)
 
-                        # Determine tempo change
-                        # Only speed up if the generated audio is too long for the slot
+                        # Determine tempo change for natural pacing
                         final_speed = 1.0
 
                         if current_duration > available_duration:
-                            # Audio is longer than segment, must speed up
-                            # Calculate required speed to fit, max 1.7x (avoid chipmunk voice)
+                            # Audio longer than slot → speed up gently, max 1.3x to avoid rush
                             required_speed = current_duration / available_duration
-                            final_speed = min(required_speed, 1.7)
+                            final_speed = min(required_speed, 1.3)
+                        elif current_duration < available_duration * 0.7:
+                            # Audio much shorter than slot → slow down slightly to fill naturally
+                            final_speed = max(current_duration / available_duration, 0.85)
 
-                        # Apply tempo change if needed (only for speeding up or extreme fitting)
+                        # Apply tempo change if needed
                         if abs(final_speed - 1.0) > 0.01:
                             # Use ffmpeg to change tempo
                             processed_path = os.path.join(
@@ -931,9 +947,11 @@ class VietnameseSubtitleGenerator:
                                 "-y",
                                 processed_path,
                             ]
-                            subprocess.run(speed_cmd, capture_output=True)
-                            if os.path.exists(processed_path):
+                            result = subprocess.run(speed_cmd, capture_output=True)
+                            if result.returncode == 0 and os.path.exists(processed_path):
                                 tts_audio = AudioSegment.from_wav(processed_path)
+                            else:
+                                logger.warning(f"atempo ffmpeg failed for segment {i}, using original audio")
 
                         # If fast-forwarded audio is still slightly longer (due to ffmpeg precision), trim it
                         if len(tts_audio) > available_duration:
@@ -1013,8 +1031,6 @@ class VietnameseSubtitleGenerator:
         Returns:
             List of dicts with 'start', 'end', 'text' keys
         """
-        import re
-
         segments = []
 
         try:
@@ -1076,6 +1092,36 @@ def prepare_srt_dir(path: str = "srt", clean: bool = True) -> Path:
 
     srt_dir.mkdir(parents=True, exist_ok=True)
     return srt_dir
+
+
+_VOICE_CHOICES = [
+    "Ngọc Lan", "Ngọc Linh", "Trúc Ly", "Mỹ Duyên",
+    "Xuân Vĩnh", "Thái Sơn", "Gia Bảo", "Đức Trí", "Trọng Hữu", "Bình An",
+]
+
+
+_VOICE_CHAR_MAP = str.maketrans({"Đ": "D", "đ": "d"})
+
+
+def _ascii_voice_key(s: str) -> str:
+    """Normalize Vietnamese voice name to ASCII for fuzzy matching."""
+    decomposed = unicodedata.normalize("NFKD", s).translate(_VOICE_CHAR_MAP)
+    return re.sub(r'[\u0300-\u036f]', '', decomposed).lower().replace(' ', '')
+
+
+_VOICE_ASCII_MAP: dict[str, str] = {_ascii_voice_key(v): v for v in _VOICE_CHOICES}
+
+
+def _normalize_voice(name: str) -> str:
+    """Normalize voice name, accepting ASCII fallback (e.g. 'Ngoc Lan' -> 'Ngọc Lan')."""
+    if name in _VOICE_CHOICES:
+        return name
+    key = _ascii_voice_key(name)
+    if key in _VOICE_ASCII_MAP:
+        return _VOICE_ASCII_MAP[key]
+    raise argparse.ArgumentTypeError(
+        f"Invalid voice '{name}'. Choose from: {', '.join(_VOICE_CHOICES)}"
+    )
 
 
 def main():
@@ -1142,9 +1188,10 @@ def main():
     parser.add_argument(
         "--voice",
         dest="voice",
-        choices=["Binh", "Tuyen", "Vinh", "Doan", "Ly", "Ngoc"],
-        default="Doan",
-        help="VieNeu TTS voice: Binh/Tuyen (male North), Vinh (male South), Doan (female South), Ly/Ngoc (female North). Default: Doan",
+        type=_normalize_voice,
+        default="Ngọc Lan",
+        metavar="VOICE",
+        help=f"VieNeu v3 Turbo TTS voice. Also accepts ASCII (e.g., 'Ngoc Lan'). Default: Ngọc Lan",
     )
 
     args = parser.parse_args()
