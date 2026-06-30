@@ -25,9 +25,10 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSizeGrip,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QFont
 import shutil
+import qtawesome as qta
 
 
 # Load translations from JSON files
@@ -583,8 +584,8 @@ class AppTk(QMainWindow):
         title_bar_layout.setContentsMargins(15, 0, 10, 0)
         self.title_bar.setLayout(title_bar_layout)
 
-        # Title with icon
-        self.title_label = QLabel(f"🎬 {self.t('title')}")
+        # Title
+        self.title_label = QLabel(self.t('title'))
         self.title_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
         self.title_label.setStyleSheet(
             f"color: {self.colors['text_dark']}; background: transparent; border: none;"
@@ -1431,9 +1432,57 @@ class AppTk(QMainWindow):
         status_layout.addWidget(size_grip, 0, Qt.AlignRight | Qt.AlignBottom)
         content_layout.addLayout(status_layout)
 
+        # Set up qtawesome icons
+        self._setup_icons()
+
     def t(self, key):
         """Get translation for current language"""
         return TRANSLATIONS[self.current_language].get(key, key)
+
+    def _setup_icons(self):
+        """Set up qtawesome icons — deferred to ensure QApp event loop is running"""
+        QTimer.singleShot(0, self._apply_icons)
+
+    def _apply_icons(self):
+        """Actually apply qtawesome icons (event loop must be running)"""
+        c = self.colors
+
+        # Browse button
+        self.browse_btn.setIcon(qta.icon('fa5s.folder-open', color='white'))
+
+        # Start/Stop/Continue button - icon based on state
+        if self.button_state == "stop":
+            self.start_btn.setIcon(qta.icon('fa5s.stop', color='white'))
+        else:
+            self.start_btn.setIcon(qta.icon('fa5s.play', color='white'))
+
+        # Export SRT button
+        self.export_srt_btn.setIcon(qta.icon('fa5s.download', color='white'))
+
+        # Voiceover button
+        self.voiceover_btn.setIcon(qta.icon('fa5s.microphone', color='white'))
+
+        # Download SRT button
+        self.download_srt_btn.setIcon(qta.icon('fa5s.download', color='white'))
+
+        # Reset button
+        reset_color = "#2C3E50" if self.current_theme == "light" else "#E0E0E0"
+        self.reset_btn.setIcon(qta.icon('fa5s.undo', color=reset_color))
+
+        # View Logs button
+        self.log_btn.setIcon(qta.icon('fa5s.file-alt', color='white'))
+
+        # Theme toggle button (icon only, no text)
+        icon_name = 'fa5s.sun' if self.current_theme == "dark" else 'fa5s.moon'
+        self.theme_btn.setIcon(qta.icon(icon_name, color=c['text_light']))
+        self.theme_btn.setText("")
+
+        # Set icon size for consistency
+        icon_size = QSize(16, 16)
+        for btn in [self.browse_btn, self.start_btn, self.export_srt_btn,
+                    self.voiceover_btn, self.download_srt_btn, self.reset_btn,
+                    self.log_btn, self.theme_btn]:
+            btn.setIconSize(icon_size)
 
     def toggle_theme(self):
         """Toggle between light and dark theme"""
@@ -1452,7 +1501,7 @@ class AppTk(QMainWindow):
 
     def update_theme(self):
         """Update all UI elements with new theme colors"""
-        self.theme_btn.setText("☀️" if self.current_theme == "dark" else "🌙")
+        self._apply_icons()
 
         hover_color = "#E8E8E8" if self.current_theme == "light" else "#3A3A3A"
 
@@ -2066,7 +2115,7 @@ class AppTk(QMainWindow):
         self.lang_btn.setText("EN" if self.current_language == "vi" else "VI")
 
         # Update all labels and buttons
-        self.title_label.setText(f"🎬 {self.t('title')}")
+        self.title_label.setText(self.t('title'))
         self.subtitle_label.setText(self.t("subtitle"))
         self.file_label.setText(self.t("video_file"))
         self.browse_btn.setText(self.t("browse"))
@@ -2115,12 +2164,15 @@ class AppTk(QMainWindow):
         if "Start" in current_btn_text or "Bắt" in current_btn_text:
             self.start_btn.setText(self.t("start_processing"))
             self.button_state = "start"
+            self.start_btn.setIcon(qta.icon('fa5s.play', color='white'))
         elif "Stop" in current_btn_text or "Dừng" in current_btn_text:
             self.start_btn.setText(self.t("stop"))
             self.button_state = "stop"
+            self.start_btn.setIcon(qta.icon('fa5s.stop', color='white'))
         elif "Continue" in current_btn_text or "Tiếp" in current_btn_text:
             self.start_btn.setText(self.t("continue"))
             self.button_state = "continue"
+            self.start_btn.setIcon(qta.icon('fa5s.play', color='white'))
 
         self.log_btn.setText(self.t("view_logs"))
         self.reset_btn.setText(self.t("reset"))
