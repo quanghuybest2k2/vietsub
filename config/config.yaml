@@ -33,6 +33,13 @@ anti_repetition:
   segment_similarity_threshold: 0.85 # similarity ratio to detect duplicates
   max_allowed_repetitions: 2 # max consecutive repetitions allowed
 
+tts:
+  temperature: 1.0
+  # Temperature for TTS generation (0.0-1.5).
+  # Higher = more expressive but may have artifacts.
+  # Lower = more stable/consistent.
+  # Recommended: 0.8-1.0 for v3 Turbo
+
 subtitles:
   font_family: "Arial"
   font_size: 24

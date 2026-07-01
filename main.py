@@ -72,6 +72,10 @@ class VietnameseSubtitleGenerator:
         # Female: Ngọc Lan (default), Ngọc Linh, Trúc Ly, Mỹ Duyên
         # Male: Xuân Vĩnh, Thái Sơn, Gia Bảo, Đức Trí, Trọng Hữu, Bình An
 
+        # TTS temperature: controls creativity/randomness in voice generation
+        # Range: 0.0-1.5. Higher = more expressive but may have artifacts.
+        self.tts_temperature = self.config.get("tts", {}).get("temperature", 1.0)
+
         # Statistics
         self.stats = {
             "transcriptions": 0,
@@ -829,6 +833,9 @@ class VietnameseSubtitleGenerator:
         """
         try:
             from vieneu import Vieneu
+            from vieneu_utils.phonemize_text import (
+                phonemize_text_with_emotions,
+            )
             from pydub import AudioSegment
             import tempfile
             import shutil
@@ -836,6 +843,7 @@ class VietnameseSubtitleGenerator:
             logger.info(f"Creating voiceover video from: {input_file}")
             logger.info(f"Using SRT file: {srt_file}")
             logger.info(f"Using VieNeu TTS voice: {self.tts_voice}")
+            logger.info(f"TTS temperature: {self.tts_temperature} (0.0-1.5, higher=more expressive)")
 
             # Parse SRT file
             segments = self._parse_srt_file(srt_file)
@@ -871,21 +879,129 @@ class VietnameseSubtitleGenerator:
                 logger.info("Initializing VieNeu TTS v3 Turbo engine...")
                 tts = Vieneu()  # Auto-detects GPU/CPU, defaults to v3 Turbo
 
-                # Generate TTS for each segment using VieNeu
-                logger.info("Generating TTS audio segments...")
-                for i, segment in enumerate(
-                    tqdm(segments, desc="Generating TTS Audio")
-                ):
-                    text = segment["text"].strip()
-                    if not text:
-                        continue
+                # Resolve the preset voice once for all segments
+                voice_data = tts.get_preset_voice(self.tts_voice)
+
+                # Check if GPU batch engine is available (PyTorch backend)
+                can_batch = (
+                    hasattr(tts, "backend") and tts.backend == "pytorch"
+                    and hasattr(tts, "engine") and tts.engine is not None
+                )
+
+                if can_batch:
+                    logger.info(
+                        "GPU detected — using V3TurboBatchEngine "
+                        "for accelerated TTS generation"
+                    )
                     try:
-                        output_path = os.path.join(temp_dir, f"tts_{i}.wav")
-                        audio = tts.infer(text, voice=self.tts_voice)
-                        tts.save(audio, output_path)
+                        from vieneu.v3_turbo_serve import V3TurboBatchEngine
+
+                        batch_engine = V3TurboBatchEngine(tts.engine)
+                        ref_codes = voice_data.get("codes")
+                        voice_token_id = voice_data.get("reserved_id")
+
+                        # Collect valid segments
+                        valid_batches = []
+                        for i, segment in enumerate(segments):
+                            text = segment["text"].strip()
+                            if text:
+                                valid_batches.append((i, text))
+
+                        total_valid = len(valid_batches)
+                        batch_size = 32
+                        generated = 0
+
+                        logger.info(
+                            f"Generating TTS for {total_valid} segments "
+                            f"in batches of {batch_size}..."
+                        )
+
+                        for batch_start in range(0, total_valid, batch_size):
+                            batch_end = min(batch_start + batch_size, total_valid)
+                            batch_items = valid_batches[batch_start:batch_end]
+
+                            # Pre-phonemize for this batch
+                            requests = []
+                            for idx, text in batch_items:
+                                phonemes = phonemize_text_with_emotions(text)
+                                requests.append({
+                                    "phonemes": phonemes,
+                                    "ref_codes": ref_codes,
+                                    "voice_token_id": voice_token_id,
+                                })
+
+                            try:
+                                wavs = batch_engine.generate_batch(
+                                    requests,
+                                    temperature=self.tts_temperature,
+                                    max_new_frames=300,
+                                )
+                                for (idx, _), wav in zip(batch_items, wavs):
+                                    if len(wav) > 0:
+                                        output_path = os.path.join(
+                                            temp_dir, f"tts_{idx}.wav"
+                                        )
+                                        tts.save(wav, output_path)
+                                        generated += 1
+                            except Exception as e:
+                                logger.warning(
+                                    f"Batch failed at group "
+                                    f"{batch_start // batch_size + 1}: {e}. "
+                                    "Falling back to individual..."
+                                )
+                                for idx, text in batch_items:
+                                    try:
+                                        output_path = os.path.join(
+                                            temp_dir, f"tts_{idx}.wav"
+                                        )
+                                        audio = tts.infer(
+                                            text,
+                                            voice=self.tts_voice,
+                                            temperature=self.tts_temperature,
+                                        )
+                                        tts.save(audio, output_path)
+                                        generated += 1
+                                    except Exception as e2:
+                                        logger.warning(
+                                            f"Failed TTS for segment {idx}: {e2}"
+                                        )
+
+                        logger.info(
+                            f"Batch TTS: {generated}/{total_valid} segments"
+                        )
+
                     except Exception as e:
-                        logger.warning(f"Failed to generate TTS for segment {i}: {e}")
-                        continue
+                        logger.warning(
+                            f"Batch engine init failed: {e}. "
+                            "Falling back to sequential..."
+                        )
+                        can_batch = False
+
+                if not can_batch:
+                    # Sequential TTS (CPU/ONNX or fallback)
+                    logger.info(
+                        f"Sequential TTS (backend: "
+                        f"{getattr(tts, 'backend', 'unknown')})"
+                    )
+                    for i, segment in enumerate(
+                        tqdm(segments, desc="Generating TTS Audio")
+                    ):
+                        text = segment["text"].strip()
+                        if not text:
+                            continue
+                        try:
+                            output_path = os.path.join(temp_dir, f"tts_{i}.wav")
+                            audio = tts.infer(
+                                text,
+                                voice=self.tts_voice,
+                                temperature=self.tts_temperature,
+                            )
+                            tts.save(audio, output_path)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed TTS for segment {i}: {e}"
+                            )
+                            continue
 
                 # Cleanup VieNeu TTS
                 tts.close()
