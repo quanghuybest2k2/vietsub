@@ -5,9 +5,10 @@
 ## Features
 
 - **Offline Speech Recognition**: faster-whisper-based accurate transcription (100% local)
-- **Advanced Translation**: NLLB-200-distilled-600M for high-quality translation (max 1024 tokens)
+- **Advanced Translation**: NLLB-200-distilled-600M via CTranslate2 (int8 / float16), 4-7x faster than plain PyTorch at the same quality
+- **GPU by default, CPU fallback**: every GPU generation gets a compute type it supports (float16 on RTX, int8 on GTX 10xx); a broken CUDA setup falls back to CPU instead of failing
 - **Auto Chunk Processing**: Automatically splits long texts to handle videos >3 hours
-- **Smart Fallback**: Multi-layer fallback (NLLB → opus-mt → Argos) ensures reliability
+- **Smart Fallback**: Multi-layer fallback (NLLB/CTranslate2 → NLLB/Transformers → opus-mt → Argos) ensures reliability
 - **Video Processing**: Add Vietnamese subtitles to video files with timing synchronization
 - **Voice-Over Generation**: Create videos with natural Vietnamese voice-over (TTS) from subtitles
 - **Subtitle Export**: Export standalone .srt subtitle files without creating video
@@ -23,7 +24,7 @@
 ## Requirements
 
 - Python 3.12.6 ([download here](https://www.python.org/downloads/release/python-3126/) - Windows installer (64-bit))
-- FFmpeg ([download here](https://www.gyan.dev/ffmpeg/builds/) - ffmpeg-git-essentials.7z)
+- FFmpeg ([download here](https://www.gyan.dev/ffmpeg/builds/) - ffmpeg-git-essentials.7z). Optional: when it is not on PATH, the binary bundled with `imageio-ffmpeg` is used
 - espeak-ng (optional): Text-to-Speech engine for TTS backup ([download here](https://github.com/espeak-ng/espeak-ng/releases))
 - No internet connection required (after installing dependencies)
 
@@ -88,7 +89,7 @@ Features:
 
 ```bash
 python main.py --video --input videos/english.mp4 --output videos/output_with_subtitles_en.mp4
-# With custom model: add --model {tiny,base,small,medium,large}
+# With custom model: add --model {tiny,base,small,medium,large,turbo}
 python main.py --video --model base --input videos/english.mp4 --output videos/output_with_subtitles_en.mp4
 ```
 
@@ -132,7 +133,7 @@ python main.py --export-srt --language ja --input videos/japanese.mp4
 python main.py --export-srt --language zh --input videos/chinese.mp4
 python main.py --export-srt --language ko --input videos/korean.mp4
 
-# With custom model (add --model {tiny,base,small,medium,large}):
+# With custom model (add --model {tiny,base,small,medium,large,turbo}):
 python main.py --export-srt --model base --language ja --input videos/japanese.mp4
 ```
 
@@ -164,7 +165,10 @@ python main.py --voiceover --input videos/english.mp4 --output videos/voiceover.
 - `base` - Recommended (~1 min/hour), good balance
 - `small` - Better accuracy (~2 min/hour)
 - `medium` - High quality (~5 min/hour)
-- `large` - Best accuracy (~10 min/hour), slowest
+- `large` - Best accuracy (large-v3, ~10 min/hour), slowest
+- `turbo` - large-v3-turbo: close to `large` accuracy at a fraction of its cost (best choice with a GPU)
+
+**Device** (optional): `--device auto|cuda|cpu` (default `auto`: GPU when it works, otherwise CPU)
 
 Full path example:
 
@@ -178,16 +182,13 @@ Note: All processing is done 100% offline. Internet is not required after depend
 
 Edit `config/config.yaml` to customize:
 
-- **Whisper model size**: tiny, base, small, medium, large (affects accuracy vs speed)
-- **Translation workers**: Number of parallel threads for video mode (default: 6, optimal for most CPUs)
-  - 6 workers: Best for 4-8 core CPUs (recommended)
-  - 8 workers (`export_translation_workers`): For SRT export mode with higher throughput
-  - Batch processing automatically optimizes throughput
+- **Whisper** (`whisper:`): model size, `device`/`compute_type` (`auto` picks what the hardware supports), `cpu_threads`, `beam_size` (`--video`) and `export_beam_size` (`--export-srt`/`--voiceover`), both 1 by default
+- **Translation** (`translation:`): `backend` (`auto` = CTranslate2 first), `beam_size` (4 = best quality, 2 ≈ 1.7x faster), `batch_size`, `cpu_threads`
+- **Anti-repetition** (`anti_repetition:`): `repetition_penalty` defaults to 1.0 — values above 1 penalise legitimately repeated words and cause mis-transcriptions
+- **SRT building** (`srt:`): merging of sentences that Whisper cut in two, before translation
+- **Burn-in encoding** (`video:`): `encoder` (`auto` uses NVENC when it works), x264 `preset` (default `veryfast`), `crf`
 - **Cache size**: Translation cache (default: 1000 entries, LRU eviction)
-- **Batch size**: `translation_batch_size: 32` (video mode), `export_translation_batch_size: 64` (export mode)
-- **Subtitle appearance**: Font, size, color, position, background opacity
-- **Video output**: Codec, bitrate, FPS settings
-- All settings optimized for offline processing with batch translation
+- **Subtitle appearance** (real-time overlay): Font, size, color, position, background opacity
 
 ## Project Structure
 
@@ -225,12 +226,13 @@ vietsub/
 ## Dependencies
 
 - `faster-whisper` - Speech recognition (offline, CTranslate2 backend)
-- `transformers` - Local neural translation models (NLLB, opus-mt)
+- `ctranslate2` - Fast int8/float16 inference for Whisper and NLLB
+- `transformers` - NLLB tokenizer, one-time model conversion and fallback translation (NLLB, opus-mt)
 - `argostranslate` - Offline statistical translation (fallback)
 - `PySide6` - Modern GUI framework
-- `opencv-python` - Video processing & subtitle overlay
-- `moviepy` - Video/audio manipulation (FFmpeg wrapper)
-- `torch` - Deep learning framework (CPU/CUDA support)
+- `opencv-python` - Real-time subtitle overlay
+- `av` / `imageio-ffmpeg` - Media decoding/probing and a bundled FFmpeg fallback
+- `torch` - Deep learning framework (CPU/CUDA support; provides the CUDA libraries)
 - `pyyaml` - Configuration parsing
 - `loguru` - Logging
 - `tqdm` - Progress bars
@@ -240,7 +242,7 @@ vietsub/
 
 ## Troubleshooting
 
-**First-time setup slow**: Local translation models will be downloaded automatically on first run (one-time only)
+**First-time setup slow**: Local translation models will be downloaded automatically on first run (one-time only). The first run also converts NLLB to CTranslate2 int8 into `models/` (~1-3 min, ~620 MB, needs PyTorch); later runs load it in about a second
 
 **Translation quality issues**:
 
@@ -249,9 +251,9 @@ vietsub/
 
 **Performance issues**:
 
-- Use smaller Whisper model (`tiny` or `base`) in `config/config.yaml` for faster processing
-- Adjust `translation_workers` (default: 6) based on your CPU cores
-- Recommended: 6 workers for 4-8 cores, 8 workers (`export_translation_workers`) for 8+ cores
+- Use smaller Whisper model (`tiny` or `base`) in `config/config.yaml` for faster processing, or `turbo` on a GPU
+- Check the log line `faster-whisper model ... loaded on cuda (...)`: if it says `cpu`, the GPU could not be used and the warning above it says why (e.g. missing cuBLAS)
+- Lower `translation.beam_size` to 2 for ~1.7x faster translation (small quality loss on Japanese)
 
 **Processing paused/stuck**:
 
@@ -265,13 +267,12 @@ vietsub/
 
 ## Performance Tips
 
-- **NLLB Model**: Uses facebook/nllb-200-distilled-600M for high-quality translation with 1024 token support
-- **Batch Translation**: Optimized batch processing with configurable size (32 for video mode, 64 for export mode)
-- **Auto Chunking**: Automatically splits long texts (>1024 tokens) for videos >3 hours
-- **Smart Caching**: Automatic LRU caching of translations (1000 entries) reduces redundant processing
-- **Parallel Processing**: Multi-threaded translation with optimized lock scope for maximum throughput
-- **CPU Usage**: Translation workers utilize multiple CPU cores efficiently (default: 6 workers, 8 for export)
-- **Memory**: Models require ~2-4GB RAM (NLLB: ~1.2GB, Whisper varies by size)
+- **NLLB Model**: facebook/nllb-200-distilled-600M, run by CTranslate2 (int8 on CPU and Pascal GPUs, float16/int8 on newer GPUs)
+- **Batch Translation**: sentences are sorted by length and translated in batches of 32 with a length cap, so one runaway sentence cannot stall a batch
+- **Auto Chunking**: Automatically splits long texts for videos >3 hours
+- **Smart Caching**: Automatic LRU caching of translations (1000 entries); identical lines are translated once
+- **Memory**: Whisper is released before NLLB loads and both before the TTS model, so peak RAM/VRAM is one model at a time
+- **Burn-in**: libx264 `veryfast` (≈1.4x faster than `medium`) or NVENC on the GPU; voiceover copies the video stream instead of re-encoding it
 - **First Run**: Allow 5-10 minutes for automatic model downloads (one-time setup)
 - **Subsequent Runs**: Fully offline with no internet dependency
 - **Speed**: Process ~1 minute of video per minute on modern CPUs (base Whisper model)

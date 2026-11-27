@@ -10,3 +10,5 @@ venv/
 build/
 dist/
 config/user_preferences.json
+models/
+logs/

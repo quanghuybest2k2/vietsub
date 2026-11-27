@@ -2,9 +2,12 @@ import threading
 import queue
 import traceback
 import subprocess
+import signal
 import sys
 import os
+import io
 import re
+import tempfile
 from pathlib import Path
 import time
 import json
@@ -26,7 +29,7 @@ from PySide6.QtWidgets import (
     QSizeGrip,
 )
 from PySide6.QtCore import Qt, QTimer, QSize
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextCursor
 import shutil
 import qtawesome as qta
 
@@ -86,6 +89,195 @@ def save_user_preferences(language, theme):
 TRANSLATIONS = load_translations()
 
 
+PROJECT_DIR = Path(__file__).resolve().parent
+MAIN_SCRIPT = str(PROJECT_DIR / "main.py")
+SRT_DIR = PROJECT_DIR / "srt"
+# Combo index -> --model value (new entries are appended so saved indices keep their meaning)
+MODEL_LIST = ["base", "tiny", "small", "medium", "large", "turbo"]
+LANG_MAP = {
+    "English": "en",
+    "Japanese": "ja",
+    "Chinese (Simplified)": "zh",
+    "Korean": "ko",
+    "Thai": "th",
+    "Indonesian": "id",
+}
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _srt_path_for(input_path: str) -> Path:
+    """SRT file main.py writes for a given video."""
+    return SRT_DIR / f"{Path(input_path).stem}_vietnamese.srt"
+
+
+def _suspend_process(process, suspend: bool) -> None:
+    """Really pause/resume a job (stopping the output reader alone let it keep running).
+
+    POSIX: SIGSTOP/SIGCONT to the job's process group, so ffmpeg children stop too.
+    Windows: NtSuspendProcess/NtResumeProcess on main.py itself.
+    """
+    if process is None or process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            PROCESS_SUSPEND_RESUME = 0x0800
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_SUSPEND_RESUME, False, process.pid
+            )
+            if handle:
+                try:
+                    if suspend:
+                        ctypes.windll.ntdll.NtSuspendProcess(handle)
+                    else:
+                        ctypes.windll.ntdll.NtResumeProcess(handle)
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            os.killpg(
+                os.getpgid(process.pid), signal.SIGSTOP if suspend else signal.SIGCONT
+            )
+    except Exception as e:
+        print(f"Could not {'suspend' if suspend else 'resume'} process: {e}")
+
+
+def _terminate_process(process, timeout: float = 3.0) -> None:
+    """Terminate a job and its children (ffmpeg), even while it is suspended."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            # Kill the whole tree: TerminateProcess on main.py alone left its
+            # ffmpeg child encoding on in the background
+            result = subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                process.terminate()
+        else:
+            pgid = os.getpgid(process.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            # A stopped process only acts on SIGTERM after SIGCONT
+            os.killpg(pgid, signal.SIGCONT)
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process.wait(timeout=timeout)
+        except Exception:
+            pass
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _build_command(mode_flag: str, input_path: str, source_lang: str, model_size: str) -> list:
+    cmd = [sys.executable, MAIN_SCRIPT, mode_flag, "--input", input_path]
+
+    # Add language flag for non-English languages
+    if source_lang and source_lang != "en":
+        cmd.extend(["--language", source_lang])
+
+    # Add model size flag if specified
+    if model_size:
+        cmd.extend(["--model", model_size])
+    return cmd
+
+
+def _run_main_subprocess(
+    cmd: list,
+    msg_queue: queue.Queue,
+    pause_event: threading.Event = None,
+    current_process_holder: list = None,
+    stop_event: threading.Event = None,
+):
+    """Run main.py and stream its output into the GUI queue.
+
+    Returns:
+        main.py exit code, or None if the user cancelled the job
+    """
+    msg_queue.put(f"Command: {' '.join(cmd)}\n")
+    msg_queue.put("=" * 80 + "\n")
+
+    # Set environment to force UTF-8 encoding for subprocess
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    # Per-job temp root owned by the GUI: removed below even when the job is
+    # killed before main.py could clean its own temp folders
+    job_tmp = tempfile.mkdtemp(prefix="vietsub_job_")
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        env[name] = job_tmp
+
+    group_kwargs = {}
+    if os.name != "nt":
+        # Own process group (inside the GUI's session), so pause/stop also reach
+        # the ffmpeg children, and the kernel still hangs up a job left stopped
+        # if the GUI dies without closing it
+        if sys.version_info >= (3, 11):
+            group_kwargs["process_group"] = 0
+        else:
+            group_kwargs["preexec_fn"] = os.setpgrp
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        # Children must never read the terminal (a background GUI froze on SIGTTOU)
+        stdin=subprocess.DEVNULL,
+        # config/, srt/ and logs/ resolve to the project wherever the GUI was started
+        cwd=str(PROJECT_DIR),
+        env=env,
+        **group_kwargs,
+    )
+
+    # Store process reference for external termination
+    if current_process_holder is not None:
+        current_process_holder[0] = process
+
+    # newline="" keeps "\r", so progress-bar refreshes can replace the last log line
+    stream = io.TextIOWrapper(process.stdout, encoding="utf-8", errors="replace", newline="")
+    paused_notified = False
+    try:
+        for raw in iter(stream.readline, ""):
+            if stop_event and stop_event.is_set():
+                break
+
+            # Safety net for platforms where suspending failed: stop reading
+            if pause_event and not pause_event.is_set():
+                if not paused_notified:
+                    msg_queue.put("__PAUSED__")
+                    paused_notified = True
+                while not pause_event.is_set() and not (stop_event and stop_event.is_set()):
+                    pause_event.wait(timeout=0.1)
+                if stop_event and stop_event.is_set():
+                    break
+                msg_queue.put("__RESUMED__")
+                paused_notified = False
+
+            is_progress = raw.endswith("\r")
+            # Clean ANSI escape codes that cause garbled text
+            clean_line = _ANSI_RE.sub("", raw.strip("\r\n"))
+            if not clean_line.strip():
+                continue
+            msg_queue.put(f"__PROGRESS__:{clean_line}" if is_progress else clean_line)
+    finally:
+        if stop_event and stop_event.is_set():
+            msg_queue.put("\n⚠ Processing terminated by user")
+            _terminate_process(process)
+        stream.close()
+        return_code = process.wait()
+        shutil.rmtree(job_tmp, ignore_errors=True)
+
+    if stop_event and stop_event.is_set():
+        return None
+    return return_code
+
+
 def worker_process_export_srt(
     input_path: str,
     msg_queue: queue.Queue,
@@ -97,136 +289,39 @@ def worker_process_export_srt(
 ):
     """Run main.py with --export-srt flag to export subtitle file only"""
     try:
-        # Build command for exporting SRT
-        cmd = [sys.executable, "main.py", "--export-srt", "--input", input_path]
-
-        # Add language flag for non-English languages
-        if source_lang and source_lang != "en":
-            cmd.insert(2, "--language")
-            cmd.insert(3, source_lang)
-
-        # Add model size flag if specified
-        if model_size:
-            cmd.append("--model")
-            cmd.append(model_size)
-
-        msg_queue.put(f"Command: {' '.join(cmd)}\n")
-        msg_queue.put("=" * 80 + "\n")
-
-        # Set environment to force UTF-8 encoding for subprocess
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-
-        # Run subprocess and capture output in real-time with proper encoding
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            universal_newlines=True,
-            env=env,
+        cmd = _build_command("--export-srt", input_path, source_lang, model_size)
+        return_code = _run_main_subprocess(
+            cmd, msg_queue, pause_event, current_process_holder, stop_event
         )
+        if return_code is None:
+            return  # cancelled: the UI has already been reset
+        if return_code != 0:
+            msg_queue.put("__DONE__:False:")
+            return
 
-        # Store process reference for external termination
-        if current_process_holder is not None:
-            current_process_holder[0] = process
+        # Find the generated .srt file in srt/ directory
+        try:
+            srt_file = _srt_path_for(input_path)
+            if not srt_file.exists():
+                # Try to find any .srt file with the video name
+                srt_files = list(SRT_DIR.glob(f"{Path(input_path).stem}*.srt"))
+                srt_file = srt_files[0] if srt_files else None
 
-        # Read output line by line
-        paused_notified = False
-        srt_file = None
-        for line in iter(process.stdout.readline, ""):
-            # Check if we should stop
-            if stop_event and stop_event.is_set():
-                msg_queue.put("\n⚠ Processing terminated by user")
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                break
+            if srt_file and srt_file.exists():
+                # Copy to Downloads
+                downloads = Path.home() / "Downloads"
+                downloads.mkdir(parents=True, exist_ok=True)
+                dest_file = downloads / srt_file.name
+                shutil.copy2(srt_file, dest_file)
 
-            if line:
-                # Check if paused
-                if pause_event and not pause_event.is_set():
-                    if not paused_notified:
-                        msg_queue.put("__PAUSED__")
-                        paused_notified = True
-
-                    # Wait until resumed or stopped
-                    while not pause_event.is_set():
-                        if stop_event and stop_event.is_set():
-                            msg_queue.put("\n⚠ Processing terminated by user")
-                            process.terminate()
-                            try:
-                                process.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                            return
-                        pause_event.wait(timeout=0.1)
-
-                    msg_queue.put("__RESUMED__")
-                    paused_notified = False
-
-                # Clean ANSI escape codes that cause garbled text
-                clean_line = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip())
-                msg_queue.put(clean_line)
-
-                # Look for output file path in the logs
-                if (
-                    "Subtitle file saved to:" in clean_line
-                    or "Subtitle file created successfully:" in clean_line
-                ):
-                    # Extract the file path
-                    parts = clean_line.split(":", 1)
-                    if len(parts) > 1:
-                        srt_file = parts[1].strip()
-
-        process.stdout.close()
-        return_code = process.wait()
-
-        if return_code == 0:
-            # Find the generated .srt file in srt/ directory
-            try:
-                import shutil
-
-                # Get video filename without extension
-                video_stem = Path(input_path).stem
-                srt_dir = Path("srt")
-
-                # Look for the generated .srt file
-                expected_srt = srt_dir / f"{video_stem}_vietnamese.srt"
-
-                if expected_srt.exists():
-                    srt_file = str(expected_srt)
-                else:
-                    # Try to find any .srt file with the video name
-                    srt_files = list(srt_dir.glob(f"{video_stem}*.srt"))
-                    if srt_files:
-                        srt_file = str(srt_files[0])
-
-                if srt_file and Path(srt_file).exists():
-                    # Copy to Downloads
-                    downloads = Path.home() / "Downloads"
-                    downloads.mkdir(parents=True, exist_ok=True)
-                    dest_file = downloads / Path(srt_file).name
-
-                    shutil.copy2(srt_file, dest_file)
-
-                    msg_queue.put(f"\n✓ Subtitle file copied to: {dest_file}")
-                    msg_queue.put(f"__DONE__:True:{dest_file}")
-                else:
-                    msg_queue.put(
-                        "\n⚠ Warning: Subtitle file not found in srt/ directory"
-                    )
-                    msg_queue.put(f"__DONE__:True:")
-            except Exception as e:
-                msg_queue.put(f"\n⚠ Warning: Could not copy to Downloads: {e}")
-                msg_queue.put(f"__DONE__:True:")
-        else:
-            msg_queue.put(f"__DONE__:False:")
+                msg_queue.put(f"\n✓ Subtitle file copied to: {dest_file}")
+                msg_queue.put(f"__DONE__:True:{dest_file}")
+            else:
+                msg_queue.put("\n⚠ Warning: Subtitle file not found in srt/ directory")
+                msg_queue.put("__DONE__:True:")
+        except Exception as e:
+            msg_queue.put(f"\n⚠ Warning: Could not copy to Downloads: {e}")
+            msg_queue.put("__DONE__:True:")
 
     except Exception as e:
         msg_queue.put(f"Exception in worker: {e}\n")
@@ -246,97 +341,23 @@ def worker_process_voiceover(
 ):
     """Run main.py with --voiceover flag to create video with Vietnamese TTS"""
     try:
-        # Build command for voiceover
-        cmd = [sys.executable, "main.py", "--voiceover", "--input", input_path]
-
-        # Add language flag for non-English languages
-        if source_lang and source_lang != "en":
-            cmd.insert(2, "--language")
-            cmd.insert(3, source_lang)
-
-        # Add model size flag if specified
-        if model_size:
-            cmd.append("--model")
-            cmd.append(model_size)
+        cmd = _build_command("--voiceover", input_path, source_lang, model_size)
 
         # Add voice flag if specified
         if voice:
-            cmd.append("--voice")
-            cmd.append(voice)
+            cmd.extend(["--voice", voice])
 
         # Add output path
         downloads = Path.home() / "Downloads"
         downloads.mkdir(parents=True, exist_ok=True)
-        stem = Path(input_path).stem
-        output_file = downloads / f"{stem}_voiceover.mp4"
+        output_file = downloads / f"{Path(input_path).stem}_voiceover.mp4"
         cmd.extend(["--output", str(output_file)])
 
-        msg_queue.put(f"Command: {' '.join(cmd)}\n")
-        msg_queue.put("=" * 80 + "\n")
-
-        # Set environment to force UTF-8 encoding for subprocess
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-
-        # Run subprocess and capture output in real-time with proper encoding
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            universal_newlines=True,
-            env=env,
+        return_code = _run_main_subprocess(
+            cmd, msg_queue, pause_event, current_process_holder, stop_event
         )
-
-        # Store process reference for external termination
-        if current_process_holder is not None:
-            current_process_holder[0] = process
-
-        # Read output line by line
-        paused_notified = False
-        for line in iter(process.stdout.readline, ""):
-            # Check if we should stop
-            if stop_event and stop_event.is_set():
-                msg_queue.put("\n⚠ Processing terminated by user")
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                break
-
-            if line:
-                # Check if paused
-                if pause_event and not pause_event.is_set():
-                    if not paused_notified:
-                        msg_queue.put("__PAUSED__")
-                        paused_notified = True
-
-                    # Wait until resumed or stopped
-                    while not pause_event.is_set():
-                        if stop_event and stop_event.is_set():
-                            msg_queue.put("\n⚠ Processing terminated by user")
-                            process.terminate()
-                            try:
-                                process.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                            return
-                        pause_event.wait(timeout=0.1)
-
-                    msg_queue.put("__RESUMED__")
-                    paused_notified = False
-
-                # Clean ANSI escape codes that cause garbled text
-                clean_line = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip())
-                msg_queue.put(clean_line)
-
-        process.stdout.close()
-        return_code = process.wait()
-
+        if return_code is None:
+            return  # cancelled: the UI has already been reset
         if return_code == 0:
             msg_queue.put(f"__DONE__:True:{output_file}")
         else:
@@ -359,92 +380,19 @@ def worker_process(
 ):
     """Run main.py as subprocess to capture all terminal output including progress bars"""
     try:
-        # Build command
-        cmd = [sys.executable, "main.py", "--video", "--input", input_path]
-
-        # Add language flag for non-English languages
-        if source_lang and source_lang != "en":
-            cmd.insert(2, "--language")
-            cmd.insert(3, source_lang)
-
-        # Add model size flag if specified
-        if model_size:
-            cmd.append("--model")
-            cmd.append(model_size)
+        cmd = _build_command("--video", input_path, source_lang, model_size)
 
         # Add output path
         downloads = Path.home() / "Downloads"
         downloads.mkdir(parents=True, exist_ok=True)
-        stem = Path(input_path).stem
-        output_file = downloads / f"{stem}_vietnamese_subtitles.mp4"
+        output_file = downloads / f"{Path(input_path).stem}_vietnamese_subtitles.mp4"
         cmd.extend(["--output", str(output_file)])
 
-        msg_queue.put(f"Command: {' '.join(cmd)}\n")
-        msg_queue.put("=" * 80 + "\n")
-
-        # Set environment to force UTF-8 encoding for subprocess
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-
-        # Run subprocess and capture output in real-time with proper encoding
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            universal_newlines=True,
-            env=env,
+        return_code = _run_main_subprocess(
+            cmd, msg_queue, pause_event, current_process_holder, stop_event
         )
-
-        # Store process reference for external termination
-        if current_process_holder is not None:
-            current_process_holder[0] = process
-
-        # Read output line by line
-        paused_notified = False
-        for line in iter(process.stdout.readline, ""):
-            # Check if we should stop
-            if stop_event and stop_event.is_set():
-                msg_queue.put("\n⚠ Processing terminated by user")
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                break
-
-            if line:
-                # Check if paused
-                if pause_event and not pause_event.is_set():
-                    if not paused_notified:
-                        msg_queue.put("__PAUSED__")
-                        paused_notified = True
-
-                    # Wait until resumed or stopped
-                    while not pause_event.is_set():
-                        if stop_event and stop_event.is_set():
-                            msg_queue.put("\n⚠ Processing terminated by user")
-                            process.terminate()
-                            try:
-                                process.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                            return
-                        pause_event.wait(timeout=0.1)
-
-                    msg_queue.put("__RESUMED__")
-                    paused_notified = False
-
-                # Clean ANSI escape codes that cause garbled text
-                clean_line = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip())
-                msg_queue.put(clean_line)
-
-        process.stdout.close()
-        return_code = process.wait()
-
+        if return_code is None:
+            return  # cancelled: the UI has already been reset
         if return_code == 0:
             msg_queue.put(f"__DONE__:True:{output_file}")
         else:
@@ -519,6 +467,8 @@ class AppTk(QMainWindow):
         self.is_paused = False
         self.paused_elapsed_time = 0  # Track elapsed time when paused
         self.button_state = "start"  # Track button state: start, stop, continue
+        self.job_started_at = None  # Wall-clock start of the current job (not pause-adjusted)
+        self._last_progress_key = None  # Key of the progress bar shown on the last log line
 
         self.init_ui()
 
@@ -979,6 +929,7 @@ class AppTk(QMainWindow):
                 self.t("model_small"),
                 self.t("model_medium"),
                 self.t("model_large"),
+                self.t("model_turbo"),
             ]
         )
         self.model_combo.setCurrentIndex(0)
@@ -1341,6 +1292,7 @@ class AppTk(QMainWindow):
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.log.document().setMaximumBlockCount(5000)  # bounded memory on long jobs
         self.log.setFont(QFont("Consolas", 9))
         self.log.setStyleSheet(
             f"""
@@ -2136,6 +2088,7 @@ class AppTk(QMainWindow):
                 self.t("model_small"),
                 self.t("model_medium"),
                 self.t("model_large"),
+                self.t("model_turbo"),
             ]
         )
         self.model_combo.setCurrentIndex(current_model_index)
@@ -2247,7 +2200,8 @@ class AppTk(QMainWindow):
         )
         if path:
             self.entry.setText(path)
-            self.start_btn.setEnabled(True)
+            if not self._job_running():  # never enable Start next to a running job
+                self.start_btn.setEnabled(True)
             self.status_label.setText(f"{self.t('selected')}: {Path(path).name}")
             self.log.append(f"{self.t('video_selected')}: {path}")
 
@@ -2260,157 +2214,25 @@ class AppTk(QMainWindow):
         elif self.button_state == "continue":
             self.resume_processing()
 
-    def start_export_srt(self):
-        """Start exporting SRT file only (without creating video)"""
-        input_path = self.entry.text()
-        if not input_path:
-            QMessageBox.warning(
-                self, self.t("no_file_selected"), self.t("select_export_warning")
-            )
-            return
-
-        # Disable buttons during processing
-        self.export_srt_btn.setEnabled(False)
-        self.start_btn.setEnabled(False)
-        self.status_label.setText(self.t("exporting"))
-        self.log.clear()
-        self.log.append(f"{self.t('starting_export')}\n")
-
-        # Read selected language from UI
-        selected_label = self.lang_combo.currentText()
-        lang_map = {
-            "English": "en",
-            "Japanese": "ja",
-            "Chinese (Simplified)": "zh",
-            "Korean": "ko",
-            "Thai": "th",
-            "Indonesian": "id",
-        }
-        selected_code = lang_map.get(selected_label, "en")
-
-        # Read selected model from UI
-        model_index = self.model_combo.currentIndex()
-        model_list = ["base", "tiny", "small", "medium", "large"]
-        selected_model = (
-            model_list[model_index] if 0 <= model_index < len(model_list) else "base"
-        )
-
-        # Reset pause state
-        self.pause_event.set()
-        self.is_paused = False
-        self.paused_elapsed_time = 0
-        self.stop_event.clear()
-
-        # Create holder for subprocess reference
-        current_process_holder = [None]
-        self.current_process = current_process_holder
-
-        self.worker = threading.Thread(
-            target=worker_process_export_srt,
-            args=(
-                input_path,
-                self.msg_queue,
-                selected_code,
-                selected_model,
-                self.pause_event,
-                current_process_holder,
-                self.stop_event,
-            ),
-        )
-        self.worker.daemon = True
-        self.worker.start()
-
-        # Start runtime timer
+    def _job_running(self) -> bool:
+        """True while a main.py job (any of the three buttons) is running."""
         try:
-            self.processing_start_time = time.time()
-            self.runtime_timer.start(1000)
+            return self.worker is not None and self.worker.is_alive()
         except Exception:
-            self.processing_start_time = None
+            return False
 
-    def start_voiceover(self):
-        """Start creating voiceover video with Vietnamese TTS"""
-        input_path = self.entry.text()
-        if not input_path:
-            QMessageBox.warning(
-                self, self.t("no_file_selected"), self.t("select_voiceover_warning")
-            )
-            return
-
-        # Disable buttons during processing
-        self.voiceover_btn.setEnabled(False)
-        self.export_srt_btn.setEnabled(False)
-        self.start_btn.setEnabled(False)
-        self.status_label.setText(self.t("voiceover_processing"))
-        self.log.clear()
-        self.log.append(f"{self.t('voiceover_starting')}\n")
-
-        # Read selected language from UI
-        selected_label = self.lang_combo.currentText()
-        lang_map = {
-            "English": "en",
-            "Japanese": "ja",
-            "Chinese (Simplified)": "zh",
-            "Korean": "ko",
-            "Thai": "th",
-            "Indonesian": "id",
-        }
-        selected_code = lang_map.get(selected_label, "en")
-
-        # Read selected model from UI
+    def _selected_options(self):
+        """Return (language code, model name) chosen in the UI."""
+        selected_code = LANG_MAP.get(self.lang_combo.currentText(), "en")
         model_index = self.model_combo.currentIndex()
-        model_list = ["base", "tiny", "small", "medium", "large"]
         selected_model = (
-            model_list[model_index] if 0 <= model_index < len(model_list) else "base"
+            MODEL_LIST[model_index] if 0 <= model_index < len(MODEL_LIST) else "base"
         )
+        return selected_code, selected_model
 
-        # Read selected voice from UI (VieNeu v3 Turbo voices)
-        # Format: "Ngọc Lan (Nữ - Dịu dàng)" → extract "Ngọc Lan"
-        selected_label = self.voice_combo.currentText()
-        selected_voice = selected_label.split(" (")[0] if " (" in selected_label else "Ngọc Lan"
-
-        # Reset pause state
-        self.pause_event.set()
-        self.is_paused = False
-        self.paused_elapsed_time = 0
-        self.stop_event.clear()
-
-        # Create holder for subprocess reference
-        current_process_holder = [None]
-        self.current_process = current_process_holder
-
-        self.worker = threading.Thread(
-            target=worker_process_voiceover,
-            args=(
-                input_path,
-                self.msg_queue,
-                selected_code,
-                selected_model,
-                self.pause_event,
-                current_process_holder,
-                self.stop_event,
-                selected_voice,
-            ),
-        )
-        self.worker.daemon = True
-        self.worker.start()
-
-        # Start runtime timer
-        try:
-            self.processing_start_time = time.time()
-            self.runtime_timer.start(1000)
-        except Exception:
-            self.processing_start_time = None
-
-    def start_processing(self):
-        """Start the processing task"""
-        input_path = self.entry.text()
-        if not input_path:
-            QMessageBox.warning(
-                self, self.t("no_file_selected"), self.t("select_video_warning")
-            )
-            return
-
-        # Change button to Stop
+    def _set_stop_button(self):
+        """Turn the main button into "Stop" (pause) for the running job."""
+        self.start_btn.setEnabled(True)
         self.start_btn.setText(self.t("stop"))
         self.button_state = "stop"
         self.start_btn.setStyleSheet(
@@ -2430,29 +2252,16 @@ class AppTk(QMainWindow):
             }}
         """
         )
-        self.status_label.setText(self.t("processing"))
-        self.log.clear()
-        self.log.append(f"{self.t('starting')}\n")
 
-        # Read selected language from UI and pass to worker
-        selected_label = self.lang_combo.currentText()
-        # Map readable label to language code expected by the processing code
-        lang_map = {
-            "English": "en",
-            "Japanese": "ja",
-            "Chinese (Simplified)": "zh",
-            "Korean": "ko",
-            "Thai": "th",
-            "Indonesian": "id",
-        }
-        selected_code = lang_map.get(selected_label, "en")
+    def _launch_job(self, target, input_path, extra_args=()):
+        """Common start logic: one job at a time, pausable and cancellable."""
+        # Only one job at a time: the jobs share the GPU/CPU and srt/ outputs
+        self.export_srt_btn.setEnabled(False)
+        self.voiceover_btn.setEnabled(False)
+        self._set_stop_button()
+        self._last_progress_key = None
 
-        # Read selected model from UI
-        model_index = self.model_combo.currentIndex()
-        model_list = ["base", "tiny", "small", "medium", "large"]
-        selected_model = (
-            model_list[model_index] if 0 <= model_index < len(model_list) else "base"
-        )
+        selected_code, selected_model = self._selected_options()
 
         # Reset pause state
         self.pause_event.set()
@@ -2465,7 +2274,7 @@ class AppTk(QMainWindow):
         self.current_process = current_process_holder
 
         self.worker = threading.Thread(
-            target=worker_process,
+            target=target,
             args=(
                 input_path,
                 self.msg_queue,
@@ -2474,22 +2283,82 @@ class AppTk(QMainWindow):
                 self.pause_event,
                 current_process_holder,
                 self.stop_event,
+                *extra_args,
             ),
         )
         self.worker.daemon = True
         self.worker.start()
+
         # Start runtime timer
+        self.job_started_at = time.time()
         try:
             self.processing_start_time = time.time()
             self.runtime_timer.start(1000)
         except Exception:
             self.processing_start_time = None
 
+    def start_export_srt(self):
+        """Start exporting SRT file only (without creating video)"""
+        input_path = self.entry.text()
+        if not input_path:
+            QMessageBox.warning(
+                self, self.t("no_file_selected"), self.t("select_export_warning")
+            )
+            return
+        if self._job_running():
+            return
+
+        self.status_label.setText(self.t("exporting"))
+        self.log.clear()
+        self.log.append(f"{self.t('starting_export')}\n")
+        self._launch_job(worker_process_export_srt, input_path)
+
+    def start_voiceover(self):
+        """Start creating voiceover video with Vietnamese TTS"""
+        input_path = self.entry.text()
+        if not input_path:
+            QMessageBox.warning(
+                self, self.t("no_file_selected"), self.t("select_voiceover_warning")
+            )
+            return
+        if self._job_running():
+            return
+
+        self.status_label.setText(self.t("voiceover_processing"))
+        self.log.clear()
+        self.log.append(f"{self.t('voiceover_starting')}\n")
+
+        # Read selected voice from UI (VieNeu v3 Turbo voices)
+        # Format: "Ngọc Lan (Nữ - Dịu dàng)" → extract "Ngọc Lan"
+        selected_label = self.voice_combo.currentText()
+        selected_voice = selected_label.split(" (")[0] if " (" in selected_label else "Ngọc Lan"
+
+        self._launch_job(worker_process_voiceover, input_path, (selected_voice,))
+
+    def start_processing(self):
+        """Start the processing task"""
+        input_path = self.entry.text()
+        if not input_path:
+            QMessageBox.warning(
+                self, self.t("no_file_selected"), self.t("select_video_warning")
+            )
+            return
+        if self._job_running():
+            return
+
+        self.status_label.setText(self.t("processing"))
+        self.log.clear()
+        self.log.append(f"{self.t('starting')}\n")
+        self._launch_job(worker_process, input_path)
+
     def pause_processing(self):
         """Pause the processing task"""
         if self.worker and self.worker.is_alive():
             self.pause_event.clear()  # Signal worker to pause
             self.is_paused = True
+            # Really stop the job (and its ffmpeg children), not just its output
+            if self.current_process and self.current_process[0] is not None:
+                _suspend_process(self.current_process[0], True)
 
             # Save elapsed time when pausing
             if self.processing_start_time:
@@ -2524,6 +2393,8 @@ class AppTk(QMainWindow):
     def resume_processing(self):
         """Resume the processing task"""
         if self.worker and self.worker.is_alive():
+            if self.current_process and self.current_process[0] is not None:
+                _suspend_process(self.current_process[0], False)
             self.pause_event.set()  # Signal worker to resume
             self.is_paused = False
 
@@ -2559,7 +2430,7 @@ class AppTk(QMainWindow):
 
     def open_log_file(self):
         """Open the log file with default text editor"""
-        log_file = Path("logs/subtitle_generator.log")
+        log_file = PROJECT_DIR / "logs" / "subtitle_generator.log"  # main.py runs in PROJECT_DIR
 
         if not log_file.exists():
             QMessageBox.warning(
@@ -2600,11 +2471,24 @@ class AppTk(QMainWindow):
         except Exception as e:
             print(f"Could not open Downloads folder: {e}")
 
-    def _check_for_srt(self):
-        """Check periodically for the presence of `temp_subtitles.srt` and toggle the download button."""
+    def _current_srt_path(self):
+        """SRT written by the job started in this session for the selected video, if any."""
+        input_path = self.entry.text().strip()
+        started = getattr(self, "job_started_at", None)
+        if not input_path or not started:
+            return None
+        srt_path = _srt_path_for(input_path)
         try:
-            srt_path = Path("temp_subtitles.srt")
-            exists = srt_path.exists()
+            if srt_path.exists() and srt_path.stat().st_mtime >= started - 1:
+                return srt_path
+        except OSError:
+            pass
+        return None
+
+    def _check_for_srt(self):
+        """Show the download button once the current job has written its SRT (kept in srt/)."""
+        try:
+            exists = self._current_srt_path() is not None
             # Only show button when file exists
             if exists and not self.download_srt_btn.isVisible():
                 self.download_srt_btn.setVisible(True)
@@ -2618,9 +2502,9 @@ class AppTk(QMainWindow):
             pass
 
     def download_srt(self):
-        """Open a save dialog and copy `temp_subtitles.srt` to the chosen location."""
-        srt_path = Path("temp_subtitles.srt")
-        if not srt_path.exists():
+        """Open a save dialog and copy the job's SRT (srt/<video>_vietnamese.srt) there."""
+        srt_path = self._current_srt_path()
+        if srt_path is None:
             QMessageBox.warning(
                 self, self.t("srt_not_found"), self.t("srt_not_available")
             )
@@ -2631,7 +2515,7 @@ class AppTk(QMainWindow):
         save_path, _ = dialog.getSaveFileName(
             self,
             self.t("save_subtitle"),
-            str(Path.home() / "Downloads" / "temp_subtitles.srt"),
+            str(Path.home() / "Downloads" / srt_path.name),
             "SRT files (*.srt);;All files (*.*)",
         )
         if not save_path:
@@ -2672,6 +2556,7 @@ class AppTk(QMainWindow):
             while True:
                 msg = self.msg_queue.get_nowait()
                 if msg.startswith("__DONE__:"):
+                    self._last_progress_key = None
                     # Format: __DONE__:<True|False>:[optional_path]
                     # Cannot use split(":", 2) because paths contain colons on Windows (e.g. C:\...)
                     suffix = msg[len("__DONE__:"):]
@@ -2746,10 +2631,43 @@ class AppTk(QMainWindow):
                     # Handle resumed notification from worker
                     pass
                 else:
-                    # Display raw output to preserve progress bars and formatting
-                    self.log.append(msg)
+                    self._append_log(msg)
         except queue.Empty:
             pass
+
+    def _append_log(self, msg: str) -> None:
+        """Append a log line; a progress-bar refresh replaces the previous one.
+
+        tqdm/ffmpeg redraw their bars with '\\r'. Appending every redraw buried
+        real warnings under thousands of near-identical lines.
+        """
+        is_progress = msg.startswith("__PROGRESS__:")
+        if is_progress:
+            msg = msg[len("__PROGRESS__:"):]
+        key = re.match(r"[^:|=]*", msg).group(0).strip()[:40]
+        last_key = getattr(self, "_last_progress_key", None)
+
+        document = self.log.document()
+        if (
+            last_key is not None
+            and key == last_key
+            # the last line must still be our progress line (the GUI may have
+            # appended its own message since)
+            and document.lastBlock().text().startswith(last_key)
+        ):
+            # Same bar as the last line: overwrite it (final "\n" state included).
+            # A document cursor edits without moving the view or the user's selection.
+            scrollbar = self.log.verticalScrollBar()
+            at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+            cursor = QTextCursor(document)
+            cursor.movePosition(QTextCursor.End)
+            cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
+            cursor.insertText(msg)
+            if at_bottom:
+                scrollbar.setValue(scrollbar.maximum())
+        else:
+            self.log.append(msg)
+        self._last_progress_key = key if is_progress else None
 
     def reset_ui(self):
         """Reset the UI to initial state: clear path, logs, status, and hide download button.
@@ -2782,15 +2700,10 @@ class AppTk(QMainWindow):
                     self.stop_event.set()
                     self.pause_event.set()  # Unblock if waiting
 
-                    # Terminate subprocess if exists
+                    # Terminate subprocess (and its ffmpeg children) if it exists,
+                    # even while it is suspended by Pause
                     if self.current_process and self.current_process[0] is not None:
-                        proc = self.current_process[0]
-                        if proc.poll() is None:  # Still running
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
+                        _terminate_process(self.current_process[0])
 
                     # Wait a bit for worker thread to finish
                     if self.worker and self.worker.is_alive():
@@ -2812,6 +2725,9 @@ class AppTk(QMainWindow):
         # Clear UI fields
         self.entry.clear()
         self.start_btn.setEnabled(False)
+        # A cancelled job never posts __DONE__, so re-enable the job buttons here
+        self.export_srt_btn.setEnabled(True)
+        self.voiceover_btn.setEnabled(True)
         self.start_btn.setText(self.t("start_processing"))
         self.button_state = "start"
         self.start_btn.setStyleSheet(
@@ -2886,6 +2802,14 @@ class AppTk(QMainWindow):
         )
 
         if reply == QMessageBox.Yes:
+            if running:
+                # Do not leave main.py (and ffmpeg) running headless after the
+                # window is gone: it would keep the GPU busy and collide with
+                # the next run.
+                self.stop_event.set()
+                self.pause_event.set()
+                if self.current_process and self.current_process[0] is not None:
+                    _terminate_process(self.current_process[0])
             event.accept()
         else:
             event.ignore()
