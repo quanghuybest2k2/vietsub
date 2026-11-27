@@ -32,6 +32,8 @@ class SubtitleLine:
     background_opacity: float = 0.7
     fade_in: float = 0.5
     fade_out: float = 0.5
+    # Pre-rendered BGRA text block (TrueType, Unicode-safe); None = OpenCV fallback
+    image: Optional[np.ndarray] = None
 
 
 class SubtitleOverlay:
@@ -97,12 +99,21 @@ class SubtitleOverlay:
             f"C:/Windows/Fonts/{self.font_family}bd.ttf",
             "C:/Windows/Fonts/arial.ttf",
             "C:/Windows/Fonts/calibri.ttf",
-            # Linux
+            # Linux (Debian/Ubuntu, Fedora, Arch, Noto)
             f"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             f"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
             # macOS
             f"/System/Library/Fonts/{self.font_family}.ttc",
             "/System/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
         ]
 
         for font_path in font_paths:
@@ -110,7 +121,36 @@ class SubtitleOverlay:
                 logger.info(f"Using font: {font_path}")
                 return font_path
 
-        logger.warning("No suitable system font found, using default")
+        # Ask fontconfig for any installed font that covers Vietnamese
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["fc-match", "-f", "%{file}", f"{self.font_family}:lang=vi"],
+                capture_output=True, text=True, timeout=5,
+            )
+            font_path = result.stdout.strip()
+            if result.returncode == 0 and font_path.lower().endswith((".ttf", ".otf", ".ttc")) and os.path.exists(font_path):
+                logger.info(f"Using font: {font_path}")
+                return font_path
+        except Exception:
+            pass
+
+        # Last resort: let Pillow search its standard font folders by file name
+        try:
+            from PIL import ImageFont
+
+            for name in ("DejaVuSans.ttf", "NotoSans-Regular.ttf", "Arial.ttf", "LiberationSans-Regular.ttf"):
+                try:
+                    font_path = ImageFont.truetype(name, 12).path
+                    logger.info(f"Using font: {font_path}")
+                    return font_path
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+        logger.warning("No TrueType font found - Vietnamese accents cannot be rendered in the overlay")
         return None
 
     def add_subtitle(self, text: str, duration: Optional[float] = None) -> None:
@@ -126,6 +166,9 @@ class SubtitleOverlay:
 
         # Format text to fit within line limits
         formatted_lines = self._format_text(text)
+        # Render once with a TrueType font (OpenCV's Hershey fonts are ASCII-only
+        # and turned every Vietnamese accented letter into '?')
+        image = self._render_text_image(formatted_lines)
 
         with self.subtitle_lock:
             # Create subtitle line
@@ -139,10 +182,12 @@ class SubtitleOverlay:
                 background_opacity=self.background_opacity,
                 fade_in=self.fade_duration,
                 fade_out=self.fade_duration,
+                image=image,
             )
 
-            # Add to active subtitles
-            self.active_subtitles.append(subtitle)
+            # A new line replaces the previous ones (they were drawn on top of
+            # each other at the same position)
+            self.active_subtitles = [subtitle]
 
             # Clean up old subtitles
             self._cleanup_expired_subtitles()
@@ -167,14 +212,81 @@ class SubtitleOverlay:
             break_on_hyphens=True,
         )
 
-        # Limit to maximum number of lines
+        # Limit to maximum number of lines (keep max_lines lines, not max_lines - 1)
         if len(wrapped_lines) > self.max_lines:
-            wrapped_lines = wrapped_lines[: self.max_lines - 1]
+            wrapped_lines = wrapped_lines[: self.max_lines]
             # Add ellipsis to indicate truncation
             if wrapped_lines:
                 wrapped_lines[-1] += "..."
 
         return wrapped_lines
+
+    def _render_text_image(self, lines: List[str]) -> Optional[np.ndarray]:
+        """Render subtitle lines into a BGRA image with a TrueType font.
+
+        Args:
+            lines: Wrapped subtitle lines
+
+        Returns:
+            BGRA uint8 image (background box + outlined text), or None when
+            Pillow or a font is unavailable (OpenCV fallback is used then)
+        """
+        if not lines or not self.font_path:
+            return None
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            font = ImageFont.truetype(self.font_path, int(self.font_size * 1.4))
+            outline = max(1, int(self.font_size / 12))
+            padding = 10
+            boxes = [font.getbbox(line, stroke_width=outline) for line in lines]
+            line_height = max(b[3] - b[1] for b in boxes) + 6
+            width = max(b[2] - b[0] for b in boxes) + 2 * padding
+            height = line_height * len(lines) + 2 * padding
+
+            bg_alpha = int(255 * max(0.0, min(1.0, self.background_opacity)))
+            image = Image.new("RGBA", (width, height), (*self.background_color, bg_alpha))
+            draw = ImageDraw.Draw(image)
+            for i, (line, box) in enumerate(zip(lines, boxes)):
+                line_width = box[2] - box[0]
+                if self.text_align == "left":
+                    x = padding
+                elif self.text_align == "right":
+                    x = width - padding - line_width
+                else:
+                    x = (width - line_width) // 2
+                draw.text(
+                    (x - box[0], padding + i * line_height - box[1]),
+                    line,
+                    font=font,
+                    fill=(*self.font_color, 255),
+                    stroke_width=outline,
+                    stroke_fill=(0, 0, 0, 255),
+                )
+            rgba = np.array(image)
+            return rgba[:, :, [2, 1, 0, 3]].copy()  # RGBA -> BGRA for OpenCV frames
+        except Exception as e:
+            logger.warning(f"TrueType subtitle rendering failed ({e}); using OpenCV font")
+            return None
+
+    def _blend_text_image(
+        self, frame: np.ndarray, image: np.ndarray, opacity: float
+    ) -> np.ndarray:
+        """Alpha-blend a pre-rendered BGRA subtitle block onto the frame."""
+        frame_height, frame_width = frame.shape[:2]
+        img_h, img_w = image.shape[:2]
+        x, y_bottom = self._calculate_text_position(img_w, img_h, frame_width, frame_height)
+        x = max(0, (frame_width - img_w) // 2)
+        y = max(0, y_bottom - img_h)
+        h = min(img_h, frame_height - y)
+        w = min(img_w, frame_width - x)
+        if h <= 0 or w <= 0:
+            return frame
+        region = frame[y : y + h, x : x + w].astype(np.float32)
+        alpha = image[:h, :w, 3:4].astype(np.float32) / 255.0 * opacity
+        blended = image[:h, :w, :3].astype(np.float32) * alpha + region * (1.0 - alpha)
+        frame[y : y + h, x : x + w] = blended.astype(np.uint8)
+        return frame
 
     def _cleanup_expired_subtitles(self) -> None:
         """Remove expired subtitles from the active list."""
@@ -306,6 +418,10 @@ class SubtitleOverlay:
         Returns:
             Frame with rendered subtitle
         """
+        if subtitle.image is not None:
+            return self._blend_text_image(frame, subtitle.image, opacity)
+
+        # Fallback: OpenCV Hershey font (ASCII only)
         # Split text into lines
         lines = subtitle.text.split("\n")
 

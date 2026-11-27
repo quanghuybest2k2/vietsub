@@ -37,8 +37,12 @@ class AudioProcessor:
 
         # Audio processing settings
         self.noise_reduction = self.config.get("noise_reduction", True)
-        self.volume_threshold = self.config.get("volume_threshold", 0.01)
+        # Absolute minimum RMS for speech; the effective gate also adapts to
+        # the room's noise floor (speech = noise_ratio x louder than the floor)
+        self.volume_threshold = self.config.get("volume_threshold", 0.002)
+        self.noise_ratio = self.config.get("noise_ratio", 3.0)
         self.silence_timeout = self.config.get("silence_timeout", 2.0)
+        self._noise_floor = self.volume_threshold
 
         # PyAudio instance
         self.pyaudio_instance = None
@@ -53,9 +57,16 @@ class AudioProcessor:
         self._temp_files = []
         self.is_paused = False
 
-        # Audio buffer for chunk assembly
+        # Audio buffer for chunk assembly (raw int16 samples)
         self.audio_buffer = deque(maxlen=int(self.sample_rate * 10))  # 10 seconds max
         self.last_audio_time = time.time()
+        # Time of the last chunk above the volume threshold, and whether the
+        # buffer holds any speech at all (silence-only buffers are dropped).
+        self.last_speech_time = time.time()
+        self._buffer_has_speech = False
+
+        # High-pass filter coefficients are constant: design them once
+        self._highpass = scipy.signal.butter(4, 300 / (self.sample_rate / 2), btype="high")
 
         # Callbacks
         self.on_audio_chunk: Optional[Callable] = None
@@ -210,41 +221,64 @@ class AudioProcessor:
                 self.audio_buffer.extend(audio_data)
                 self.last_audio_time = timestamp
 
-                # Apply preprocessing
-                processed_audio = self._preprocess_audio(audio_data)
-
-                # Check for speech/silence
+                # Check for speech/silence on the filtered but NOT normalized
+                # signal (per-chunk normalization made silence look like speech)
+                processed_audio = self._preprocess_audio(audio_data, normalize=False)
                 volume_level = self._calculate_volume(processed_audio)
+                gate = max(self.volume_threshold, self.noise_ratio * self._noise_floor)
+                is_speech = volume_level > gate
 
-                if volume_level > self.volume_threshold:
+                # Track the background level: fast down, slow up (only on non-speech)
+                if volume_level < self._noise_floor:
+                    self._noise_floor = 0.7 * self._noise_floor + 0.3 * volume_level
+                elif not is_speech:
+                    self._noise_floor = 0.98 * self._noise_floor + 0.02 * volume_level
+                logger.trace(f"audio level {volume_level:.4f} gate {gate:.4f}")
+
+                if is_speech:
                     # Speech detected, continue accumulating
-                    pass
-                else:
-                    # Check for silence timeout
-                    silence_duration = time.time() - self.last_audio_time
-                    if (
-                        silence_duration > self.silence_timeout
-                        and len(self.audio_buffer) > 0
-                    ):
-                        # Process accumulated audio chunk
-                        self._process_accumulated_audio()
+                    self.last_speech_time = timestamp
+                    self._buffer_has_speech = True
+                elif (
+                    self._buffer_has_speech
+                    and timestamp - self.last_speech_time > self.silence_timeout
+                ):
+                    # End of an utterance: process it now
+                    self._process_accumulated_audio()
+                elif not self._buffer_has_speech:
+                    # Still silent: keep only a 0.5 s pre-roll so the next chunk
+                    # starts just before the speech instead of mid-sentence
+                    preroll = self.sample_rate // 2
+                    if len(self.audio_buffer) > preroll + len(audio_data):
+                        tail = list(self.audio_buffer)[-preroll:]
+                        self.audio_buffer.clear()
+                        self.audio_buffer.extend(tail)
 
                 # Process chunk if buffer is getting full
                 buffer_duration = len(self.audio_buffer) / self.sample_rate
                 if buffer_duration >= 5.0:  # 5 seconds of audio
-                    self._process_accumulated_audio()
+                    if self._buffer_has_speech:
+                        self._process_accumulated_audio()
+                        # Still mid-utterance: keep accumulating (no pre-roll trim)
+                        self._buffer_has_speech = (
+                            timestamp - self.last_speech_time <= self.silence_timeout
+                        )
+                    else:
+                        # Only silence: don't make Whisper hallucinate on it
+                        self.audio_buffer.clear()
 
             except queue.Empty:
                 continue
             except Exception as e:
                 logger.error(f"Error processing audio chunk: {e}")
 
-    def _preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
+    def _preprocess_audio(self, audio_data: np.ndarray, normalize: bool = True) -> np.ndarray:
         """
         Apply audio preprocessing techniques.
 
         Args:
             audio_data: Raw audio data as numpy array
+            normalize: Scale the peak to 0.8 (never use for volume measurement)
 
         Returns:
             Preprocessed audio data
@@ -253,16 +287,15 @@ class AudioProcessor:
         audio_float = audio_data.astype(np.float32) / 32768.0
 
         if self.noise_reduction:
-            # Simple high-pass filter to reduce low-frequency noise
-            nyquist = self.sample_rate / 2
-            low_cutoff = 300 / nyquist  # 300 Hz high-pass
-            b, a = scipy.signal.butter(4, low_cutoff, btype="high")
-            audio_float = scipy.signal.filtfilt(b, a, audio_float)
+            # Simple high-pass filter (300 Hz) to reduce low-frequency noise
+            b, a = self._highpass
+            audio_float = scipy.signal.lfilter(b, a, audio_float)
 
             # Normalize audio
-            max_val = np.max(np.abs(audio_float))
-            if max_val > 0:
-                audio_float = audio_float / max_val * 0.8  # Prevent clipping
+            if normalize:
+                max_val = np.max(np.abs(audio_float))
+                if max_val > 0:
+                    audio_float = audio_float / max_val * 0.8  # Prevent clipping
 
         return audio_float
 
@@ -283,8 +316,9 @@ class AudioProcessor:
         if len(self.audio_buffer) == 0:
             return
 
-        # Convert deque to numpy array
-        audio_array = np.array(list(self.audio_buffer))
+        # Convert deque to numpy array (raw int16 samples)
+        audio_array = np.fromiter(self.audio_buffer, dtype=np.int16, count=len(self.audio_buffer))
+        self._buffer_has_speech = False
 
         # Save to temporary WAV file for Whisper processing
         temp_file = self._save_audio_to_temp_file(audio_array)
@@ -317,8 +351,12 @@ class AudioProcessor:
             temp_fd, temp_path = tempfile.mkstemp(suffix=".wav")
             os.close(temp_fd)
 
-            # Convert float audio back to int16
-            audio_int16 = (audio_data * 32767).astype(np.int16)
+            # The buffer already holds int16 PCM; only float input needs scaling
+            # (multiplying int16 samples by 32767 overflowed and destroyed the audio)
+            if np.issubdtype(audio_data.dtype, np.floating):
+                audio_int16 = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
+            else:
+                audio_int16 = audio_data.astype(np.int16)
 
             # Save as WAV file
             with wave.open(temp_path, "wb") as wav_file:
